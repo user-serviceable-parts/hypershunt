@@ -513,7 +513,7 @@ listed in [`<l4-proxy-opt>`](#l4-proxy-opt).
 
 ### `l4-proxy-opt`
 
-- `"tls"` ( `skip-verify=`[`<boolean>`](#boolean) )?
+- [`<upstream-tls>`](#upstream-tls)
 - `"dtls"` ( `skip-verify=`[`<boolean>`](#boolean) )?
 - [`<policy-block>`](#policy-block)
 
@@ -641,7 +641,8 @@ All repeating single-argument children (rule 4).
 - `"upstream"` [`<string>`](#string)
   ( `weight=`[`<integer>`](#integer) )?
   ( `group=`[`<string>`](#string) )?
-- `"tls"` ( `skip-verify=`[`<boolean>`](#boolean) )?
+  ( `{` [`<upstream-tls>`](#upstream-tls) `}` )?
+- [`<upstream-tls>`](#upstream-tls)
 - `"lb-policy"` [`<lb-policy-kind>`](#lb-policy-kind)
   ( `header=`[`<string>`](#string) )?
 - `"group-by"` [`<string>`](#string)
@@ -652,7 +653,21 @@ All repeating single-argument children (rule 4).
 
 `upstream` is the only required child (at least one).  It is a
 repeating single-argument child (rule 4); `weight=` is an
-optional per-upstream property.
+optional per-upstream property.  An `upstream`'s own `tls` is laid
+over the pool-level `tls` field by field.
+
+### `upstream-tls`
+
+`"tls"` ( `skip-verify=`[`<boolean>`](#boolean) )?
+( `{` [`<upstream-tls-child>`](#upstream-tls-child)* `}` )?
+
+### `upstream-tls-child`
+
+- `"ca-file"` [`<string>`](#string)
+- `"server-name"` [`<string>`](#string)
+
+`skip-verify=#true` and either child on the same (or merged) node is
+a startup error.
 
 ### `lb-policy-kind`
 

@@ -211,8 +211,6 @@ pub fn build_handler(
             connect_timeout_secs,
             grpc,
         } => {
-            let skip_verify =
-                upstream_tls.as_ref().map(|t| t.skip_verify).unwrap_or(false);
             let group_by = group_by
                 .as_deref()
                 .map(|s| {
@@ -233,7 +231,7 @@ pub fn build_handler(
                 *scheme,
                 *pool_idle_timeout_secs,
                 *pool_max_idle,
-                skip_verify,
+                upstream_tls.as_ref(),
                 *connect_timeout_secs,
                 grpc.clone(),
                 metrics.clone(),
@@ -244,7 +242,10 @@ pub fn build_handler(
             // probe stall can never wedge real traffic.
             if let Some(hc) = active_health {
                 let prober: Arc<dyn crate::lb::HealthProber> = Arc::new(
-                    proxy::HttpHealthProber::new(skip_verify)?,
+                    proxy::HttpHealthProber::new(
+                        upstreams,
+                        upstream_tls.as_ref(),
+                    )?,
                 );
                 crate::lb::spawn_active_health_task(
                     h.pool().clone(),

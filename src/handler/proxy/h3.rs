@@ -6,7 +6,8 @@
 // (forced HTTP/3 upstream) and for Alt-Svc-driven auto-upgrade from
 // h1/h2 (see `InnerProxyClient` in the parent module).
 
-use super::{SkipServerVerification, UpstreamBody};
+use super::UpstreamBody;
+use crate::upstream_tls::UpstreamTls;
 use crate::error::HttpResponse;
 use hyper::{Request, Response, Uri};
 use std::sync::Arc;
@@ -18,8 +19,11 @@ use std::sync::Arc;
 pub(crate) struct H3Client {
     endpoint: quinn::Endpoint,
     authority: hyper::http::uri::Authority,
-    /// SNI server name (host component of the upstream URL).
-    server_name: String,
+    /// Host component of the upstream URL, used for DNS resolution.
+    host: String,
+    /// Name presented as SNI and verified: the configured
+    /// `server-name` override, or `host` when there is none.
+    sni: String,
     /// Shared metrics handle, incremented on every fresh handshake.
     /// Set by the parent proxy module after construction.
     pub(super) metrics: Option<Arc<crate::metrics::Metrics>>,
@@ -74,31 +78,15 @@ impl H3Client {
 
     pub(crate) fn new(
         upstream: &Uri,
+        tls: &UpstreamTls,
         pool_idle: Option<std::time::Duration>,
     ) -> anyhow::Result<Self> {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let crypto = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        Self::new_with_crypto(upstream, crypto, pool_idle)
-    }
-
-    /// Constructs a client whose TLS verifier accepts any certificate.
-    /// Intended for internal upstreams with self-signed certs
-    /// (`proxy { tls { skip-verify } }`).  Operators take
-    /// responsibility for the relaxed trust by opting in explicitly.
-    pub(crate) fn new_skip_verify(
-        upstream: &Uri,
-        pool_idle: Option<std::time::Duration>,
-    ) -> anyhow::Result<Self> {
-        let crypto = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(
-                SkipServerVerification,
-            ))
-            .with_no_client_auth();
-        Self::new_with_crypto(upstream, crypto, pool_idle)
+        // quinn wants to own its ClientConfig, and it sets the `h3`
+        // ALPN below, so the shared config is cloned rather than
+        // mutated under everyone else.
+        let crypto = (*tls.config).clone();
+        let sni = tls.server_name.as_ref().map(server_name_to_string);
+        Self::new_with_crypto(upstream, crypto, sni, pool_idle)
     }
 
     /// Convenience wrapper for unit tests against local self-signed
@@ -109,12 +97,19 @@ impl H3Client {
         upstream: &Uri,
         pool_idle: Option<std::time::Duration>,
     ) -> anyhow::Result<Self> {
-        Self::new_skip_verify(upstream, pool_idle)
+        let tls = crate::upstream_tls::build_upstream_tls(
+            &crate::config::UpstreamTlsConfig {
+                skip_verify: true,
+                ..Default::default()
+            },
+        )?;
+        Self::new(upstream, &tls, pool_idle)
     }
 
     fn new_with_crypto(
         upstream: &Uri,
         mut crypto: rustls::ClientConfig,
+        sni: Option<String>,
         pool_idle: Option<std::time::Duration>,
     ) -> anyhow::Result<Self> {
         crypto.alpn_protocols = vec![b"h3".to_vec()];
@@ -130,13 +125,12 @@ impl H3Client {
             .authority()
             .ok_or_else(|| anyhow::anyhow!("upstream has no authority"))?
             .clone();
-        let server_name = authority.host().to_owned();
+        let host = authority.host().to_owned();
         // Validate the SNI name parses as a valid rustls ServerName so
         // we fail fast at config time, not at first request.
-        let _ = <rustls::pki_types::ServerName<'_>>::try_from(
-            server_name.as_str(),
-        )
-        .map_err(|e| anyhow::anyhow!("bad upstream host {server_name:?}: {e}"))?;
+        let _ = <rustls::pki_types::ServerName<'_>>::try_from(host.as_str())
+            .map_err(|e| anyhow::anyhow!("bad upstream host {host:?}: {e}"))?;
+        let sni = sni.unwrap_or_else(|| host.clone());
         // Idle reaper: 0 disables, None falls back to the default.
         // Cached entries are evicted when `last_used + idle < now`
         // so an upstream that goes quiet doesn't keep QUIC state
@@ -177,7 +171,8 @@ impl H3Client {
         Ok(Self {
             endpoint,
             authority,
-            server_name,
+            host,
+            sni,
             metrics: None,
             cached,
             reaper,
@@ -191,7 +186,7 @@ impl H3Client {
     async fn resolve(&self) -> anyhow::Result<std::net::SocketAddr> {
         let port = self.authority.port_u16().unwrap_or(443);
         let addrs: Vec<std::net::SocketAddr> =
-            tokio::net::lookup_host((self.server_name.as_str(), port))
+            tokio::net::lookup_host((self.host.as_str(), port))
                 .await?
                 .collect();
         addrs
@@ -203,7 +198,7 @@ impl H3Client {
     /// Build a fresh `H3Cached`: connect, h3-handshake, spawn driver.
     async fn build_cached(&self) -> anyhow::Result<H3Cached> {
         let addr = self.resolve().await?;
-        let connecting = self.endpoint.connect(addr, &self.server_name)?;
+        let connecting = self.endpoint.connect(addr, &self.sni)?;
         // Bound the handshake when `connect_timeout` is set; otherwise
         // let quinn's defaults stand (5 s handshake deadline + idle).
         let conn = match self.connect_timeout {
@@ -409,5 +404,17 @@ impl H3Client {
         let body_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let body = http_body_util::StreamBody::new(body_stream).boxed();
         Ok(Response::from_parts(resp_parts, body))
+    }
+}
+
+/// quinn takes the server name as a string; rustls's `ServerName`
+/// only exposes it piecewise.
+fn server_name_to_string(n: &rustls::pki_types::ServerName<'_>) -> String {
+    match n {
+        rustls::pki_types::ServerName::DnsName(d) => d.as_ref().to_owned(),
+        rustls::pki_types::ServerName::IpAddress(ip) => {
+            std::net::IpAddr::from(*ip).to_string()
+        }
+        _ => format!("{n:?}"),
     }
 }

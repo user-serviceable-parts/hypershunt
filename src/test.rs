@@ -340,3 +340,208 @@ impl TestBackend {
         }
     }
 }
+
+// -- Test PKI ---------------------------------------------------------
+
+/// Throwaway certificates for upstream-TLS tests: a CA and one leaf
+/// it issued.  Everything is in memory; `write()` drops the three
+/// PEM files into a temp dir for configs that need paths.
+pub(crate) mod certs {
+    use rcgen::{
+        CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+        SanType,
+    };
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    pub(crate) struct TestPki {
+        pub ca_pem: String,
+        pub leaf_cert_pem: String,
+        pub leaf_key_pem: String,
+        // Kept so further leaves can be issued under the same CA.
+        ca_params: CertificateParams,
+        ca_key_pem: String,
+    }
+
+    pub(crate) struct PkiFiles {
+        pub ca: PathBuf,
+        pub cert: PathBuf,
+        pub key: PathBuf,
+    }
+
+    impl Drop for PkiFiles {
+        fn drop(&mut self) {
+            for p in [&self.ca, &self.cert, &self.key] {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    /// Issue a leaf for `sans` (DNS names or IP literals) signed by a
+    /// fresh CA.
+    pub(crate) fn issue(sans: &[&str]) -> TestPki {
+        let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca.distinguished_name
+            .push(DnType::CommonName, "hypershunt test CA");
+        ca.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_pem = ca.self_signed(&ca_key).unwrap().pem();
+        let ca_key_pem = ca_key.serialize_pem();
+        issue_leaf(ca_pem, ca, ca_key_pem, sans)
+    }
+
+    /// Issue another leaf under `ca`'s CA, for pools where several
+    /// backends share one private PKI.
+    pub(crate) fn issue_with_ca(ca: &TestPki, sans: &[&str]) -> TestPki {
+        issue_leaf(
+            ca.ca_pem.clone(),
+            ca.ca_params.clone(),
+            ca.ca_key_pem.clone(),
+            sans,
+        )
+    }
+
+    fn issue_leaf(
+        ca_pem: String,
+        ca_params: CertificateParams,
+        ca_key_pem: String,
+        sans: &[&str],
+    ) -> TestPki {
+        let ca_key = KeyPair::from_pem(&ca_key_pem).unwrap();
+        let issuer = Issuer::new(ca_params.clone(), ca_key);
+        let mut leaf = CertificateParams::new(Vec::<String>::new()).unwrap();
+        leaf.distinguished_name
+            .push(DnType::CommonName, "hypershunt test leaf");
+        for s in sans {
+            let san = match s.parse::<std::net::IpAddr>() {
+                Ok(ip) => SanType::IpAddress(ip),
+                Err(_) => SanType::DnsName((*s).try_into().unwrap()),
+            };
+            leaf.subject_alt_names.push(san);
+        }
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_cert_pem = leaf.signed_by(&leaf_key, &issuer).unwrap().pem();
+        TestPki {
+            ca_pem,
+            leaf_cert_pem,
+            leaf_key_pem: leaf_key.serialize_pem(),
+            ca_params,
+            ca_key_pem,
+        }
+    }
+
+    /// Just a CA, for tests that only need a bundle to load.
+    pub(crate) fn ca_pem_only() -> String {
+        issue(&["unused.test"]).ca_pem
+    }
+
+    impl TestPki {
+        pub(crate) fn write(&self, tag: &str) -> PkiFiles {
+            let dir = std::env::temp_dir();
+            let stem = format!("hypershunt-pki-{}-{tag}", std::process::id());
+            let f = PkiFiles {
+                ca: dir.join(format!("{stem}-ca.pem")),
+                cert: dir.join(format!("{stem}-cert.pem")),
+                key: dir.join(format!("{stem}-key.pem")),
+            };
+            std::fs::write(&f.ca, &self.ca_pem).unwrap();
+            std::fs::write(&f.cert, &self.leaf_cert_pem).unwrap();
+            std::fs::write(&f.key, &self.leaf_key_pem).unwrap();
+            f
+        }
+
+        /// rustls server config presenting the leaf.
+        pub(crate) fn server_config(&self) -> Arc<rustls::ServerConfig> {
+            let certs = rustls_pemfile::certs(
+                &mut self.leaf_cert_pem.as_bytes(),
+            )
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+            let key = rustls_pemfile::private_key(
+                &mut self.leaf_key_pem.as_bytes(),
+            )
+            .unwrap()
+            .unwrap();
+            Arc::new(
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)
+                    .unwrap(),
+            )
+        }
+    }
+}
+
+// -- TestTlsBackend ---------------------------------------------------
+
+/// HTTPS backend for upstream-TLS tests.  Serves `200 ok` over
+/// HTTP/1.1 behind the given leaf and records the SNI each
+/// connection presented, so a test can assert what name the proxy
+/// actually sent.
+pub(crate) struct TestTlsBackend {
+    pub addr: SocketAddr,
+    sni_seen: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    _handle: tokio::task::JoinHandle<()>,
+}
+
+impl TestTlsBackend {
+    pub async fn start(pki: &certs::TestPki) -> Self {
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        use tokio_rustls::LazyConfigAcceptor;
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider()
+            .install_default();
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_cfg = pki.server_config();
+        let sni_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sni_seen.clone();
+
+        let handle = tokio::spawn(async move {
+            while let Ok((conn, _)) = listener.accept().await {
+                let cfg = server_cfg.clone();
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let acceptor = LazyConfigAcceptor::new(
+                        rustls::server::Acceptor::default(),
+                        conn,
+                    );
+                    let Ok(start) = acceptor.await else { return };
+                    seen.lock().unwrap().push(
+                        start.client_hello().server_name().map(String::from),
+                    );
+                    let Ok(tls) = start.into_stream(cfg).await else {
+                        return;
+                    };
+                    let svc = service_fn(|_req| async {
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::new(
+                                http_body_util::Full::new(Bytes::from_static(
+                                    b"ok",
+                                )),
+                            ),
+                        )
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(tls), svc)
+                        .await;
+                });
+            }
+        });
+        Self {
+            addr,
+            sni_seen,
+            _handle: handle,
+        }
+    }
+
+    /// SNI values presented so far, in connection order.  `None` is a
+    /// ClientHello without the extension (rustls sends none for IP
+    /// server names).
+    pub fn sni_seen(&self) -> Vec<Option<String>> {
+        self.sni_seen.lock().unwrap().clone()
+    }
+}

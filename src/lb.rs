@@ -755,11 +755,13 @@ mod tests {
                 url: "http://h0/".into(),
                 weight: 1,
                 group: None,
+                tls: None,
             },
             UpstreamConfig {
                 url: "http://h1/".into(),
                 weight: 1,
                 group: None,
+                tls: None,
             },
         ]);
         let pool = Arc::new(UpstreamPool::new(
@@ -789,11 +791,13 @@ mod tests {
                 url: "http://h0/".into(),
                 weight: 1,
                 group: None,
+                tls: None,
             },
             UpstreamConfig {
                 url: "http://h1/".into(),
                 weight: 1,
                 group: None,
+                tls: None,
             },
         ]);
         let pool = Arc::new(UpstreamPool::new(

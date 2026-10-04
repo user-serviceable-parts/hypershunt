@@ -375,71 +375,17 @@ pub(crate) async fn build_cert_registry(
     Ok((registry, handles))
 }
 
-/// Build a rustls `ClientConfig` for upstream TLS connections in stream
-/// proxies.  Returns `None` when the proxy has no `upstream_tls`.
+/// Build the upstream TLS client for a stream proxy.  Returns `None`
+/// when the proxy has no `upstream_tls`.
 pub(crate) fn build_upstream_tls(
     proxy: &ProxyConfig,
-) -> anyhow::Result<Option<Arc<rustls::ClientConfig>>> {
-    let utls = match &proxy.upstream_tls {
-        Some(u) => u,
-        None => return Ok(None),
-    };
-    let cfg = if utls.skip_verify {
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-            .with_no_client_auth()
-    } else {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
-    };
-    Ok(Some(Arc::new(cfg)))
-}
-
-/// A rustls certificate verifier that accepts any server
-/// certificate.  Only used when `tls { skip-verify }` is set on a
-/// stream listener's upstream block.
-#[derive(Debug)]
-struct SkipServerVerification;
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-    {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-    {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
+) -> anyhow::Result<Option<crate::upstream_tls::UpstreamTls>> {
+    proxy
+        .upstream_tls
+        .as_ref()
+        .map(crate::upstream_tls::build_upstream_tls)
+        .transpose()
+        .with_context(|| {
+            format!("stream proxy to {}", proxy.upstream)
+        })
 }

@@ -741,6 +741,31 @@ proxy { upstream "unix-stream:/run/api.sock" }
 proxy scheme="h3" { upstream "https://api.example.com" }
 ```
 
+### Upstream TLS trust
+
+An `https://` upstream is verified against the public roots under
+the URL host, which is right for a public API and wrong for most
+internal backends.  The [`tls`](reference.md#tls-proxy-upstream)
+block fixes both halves without turning verification off:
+`ca-file` trusts a private CA instead of the public roots, and
+`server-name` names the certificate when the backend is reached by
+an address that is not in it.  Put the block on `proxy` as the
+pool default, or on one `upstream` to override it there.
+
+```kdl
+proxy {
+    tls { ca-file "pki/internal-ca.pem" }          // pool default
+    upstream "https://10.0.0.5:8443" {
+        tls { server-name "api.internal" }         // this one only
+    }
+    upstream "https://10.0.0.6:8443"               // inherits the CA
+}
+```
+
+`tls skip-verify=#true` remains available for a self-signed
+development backend; it cannot be combined with `ca-file` or
+`server-name`, because the two express opposite intents.
+
 ### Forwarded headers
 
 By default hypershunt adds:
@@ -2264,13 +2289,22 @@ Terminate TLS on the way in, originate TLS on the way out:
 ```kdl
 listener "tcp://0.0.0.0:5432" {
     tls "files" cert="edge.pem" key="edge.key"
-    proxy "tcp://10.0.0.5:5432" { tls skip-verify=#false }
+    proxy "tcp://10.0.0.5:5432" {
+        tls {
+            ca-file "pki/internal-ca.pem"
+            server-name "db.internal"
+        }
+    }
 }
 ```
 
-The `tls skip-verify=#true` knob exists for backends with
-self-signed certificates; never use it across networks you don't
-control.
+A stream upstream is known only by IP, so without `server-name`
+the certificate is checked against that IP; `server-name` supplies
+the hostname the certificate was actually issued for, and
+`ca-file` trusts the private CA that issued it (see
+[`tls`](reference.md#tls-upstream)).  The `tls skip-verify=#true`
+knob exists for backends with self-signed certificates; never use
+it across networks you don't control.
 
 ### UDP forwarding
 

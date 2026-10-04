@@ -2170,9 +2170,26 @@ listener "tcp://[::]:5432" {
 **Child** of [`proxy`](#proxy-listener).  Optional, byte-stream
 upstreams only.
 
-Wraps the upstream connection in TLS.  Properties:
+Wraps the upstream connection in TLS.  Takes the same property and
+children as the HTTP proxy's [`tls`](#tls-proxy-upstream):
 `skip-verify=` (boolean; default `#false`) disables certificate
-verification — only useful with self-signed backends.
+verification; `ca-file "<path>"` replaces the public roots with a
+private CA bundle; `server-name "<name>"` sets the SNI and verified
+name.
+
+A stream upstream is known only by address, so without `server-name`
+the certificate is checked against the upstream's IP (or `localhost`
+for a Unix-socket upstream).  Most certificates are issued for
+hostnames, so a verified stream backend usually needs both children:
+
+```kdl
+proxy "tcp://10.0.0.5:5432" {
+    tls {
+        ca-file "pki/internal-ca.pem"
+        server-name "db.internal"
+    }
+}
+```
 
 #### dtls (upstream)
 
@@ -3103,10 +3120,13 @@ regardless of the path used).  Optional `weight=<integer>`
 property; `0` parks the upstream (it stays in the pool but
 receives no traffic until the weight is raised).  Optional
 `group="<name>"` label targeted by [`group-by`](#group-by).
+Optional [`tls`](#tls-proxy-upstream) child for an `https://`
+upstream whose trust settings differ from the pool's.
 
 ```kdl
 upstream "http://backend.internal:9000"
 upstream "http://backup.internal:9000" weight=0
+upstream "https://10.0.0.5:8443" { tls { server-name "api.internal" } }
 ```
 
 ##### group-by
@@ -3300,11 +3320,44 @@ Per-attempt TCP connect timeout (seconds).
 
 ##### tls (proxy upstream)
 
-**Child** of [`proxy`](#proxy-handler).  Optional.
+**Child** of [`proxy`](#proxy-handler) and of
+[`upstream`](#upstream).  Optional.
 
-Per-pool TLS knobs.  Only meaningful when at least one upstream
-is `https://`.  Single property: `skip-verify=` (boolean;
-default `#false`) disables certificate verification.
+How hypershunt trusts an `https://` upstream.  On `proxy` it is the
+default for every upstream in the pool; on an `upstream` it is laid
+over that default field by field, so an upstream can add a
+`server-name` and keep the pool's `ca-file`.  Only meaningful for
+`https://` upstreams; setting any of these on an `http://` upstream
+is a startup error.
+
+Property:
+
+- `skip-verify=` (boolean; default `#false`) accepts any
+  certificate.  Only for internal or development backends with
+  self-signed certificates.  Cannot be combined with the children
+  below.
+
+Children:
+
+- `ca-file "<path>"` -- PEM bundle of CA certificates that
+  **replaces** the public roots for this upstream.  A relative path
+  resolves against the config file's directory.  The file is read
+  at startup; a missing file or one with no certificates is an
+  error.
+- `server-name "<name>"` -- the name sent as SNI and checked
+  against the certificate, for a backend reached at an address its
+  certificate does not cover.  A DNS name or an IP literal.  DNS
+  resolution still uses the URL host.
+
+```kdl
+proxy {
+    tls { ca-file "pki/internal-ca.pem" }
+    upstream "https://10.0.0.5:8443" {
+        tls { server-name "api.internal" }
+    }
+    upstream "https://10.0.0.6:8443"
+}
+```
 
 ##### lb-policy
 

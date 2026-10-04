@@ -8,7 +8,9 @@
 // because the header encodes the client IP at connection establishment.
 // Both TCP and Unix socket upstreams are supported in this mode.
 
-use crate::config::ProxyProtocolVersion;
+use crate::config::{ProxyProtocolVersion, UpstreamTlsConfig};
+use crate::upstream_tls::build_upstream_tls;
+use anyhow::Context as _;
 use crate::error::{HttpResponse, response_502};
 use crate::error::ReqBody;
 use crate::handler::Handler;
@@ -154,10 +156,11 @@ impl ProxyHandler {
         scheme: crate::config::ProxyUpstreamScheme,
         pool_idle_timeout_secs: Option<u64>,
         pool_max_idle: Option<u32>,
-        skip_verify: bool,
+        tls: Option<&UpstreamTlsConfig>,
         connect_timeout_secs: Option<u64>,
         grpc: Option<&crate::config::GrpcConfig>,
     ) -> anyhow::Result<Self> {
+        let tls = build_upstream_tls(&tls.cloned().unwrap_or_default())?;
         let inner = InnerProxyClient::new(
             upstream_str,
             strip_prefix,
@@ -165,7 +168,7 @@ impl ProxyHandler {
             scheme,
             pool_idle_timeout_secs,
             pool_max_idle,
-            skip_verify,
+            tls,
             connect_timeout_secs,
             grpc,
         )?;
@@ -193,9 +196,10 @@ impl ProxyHandler {
 
     /// Multi-upstream constructor.  Consumes the parsed proxy config
     /// fields and builds one `InnerProxyClient` per upstream plus the
-    /// shared [`UpstreamPool`].  All upstreams share the same TLS,
-    /// pool, scheme, and proxy-protocol settings (those knobs live on
-    /// the outer `proxy` block, not on individual `upstream` children).
+    /// shared [`UpstreamPool`].  Pool, scheme and proxy-protocol
+    /// settings are shared (those knobs live on the outer `proxy`
+    /// block); TLS trust is resolved per upstream from the pool's
+    /// `tls` block with the upstream's own `tls` laid over it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_pool(
         upstreams_cfg: &[crate::config::UpstreamConfig],
@@ -209,7 +213,7 @@ impl ProxyHandler {
         scheme: crate::config::ProxyUpstreamScheme,
         pool_idle_timeout_secs: Option<u64>,
         pool_max_idle: Option<u32>,
-        skip_verify: bool,
+        pool_tls: Option<&UpstreamTlsConfig>,
         connect_timeout_secs: Option<u64>,
         grpc: Option<crate::config::GrpcConfig>,
         metrics: Arc<crate::metrics::Metrics>,
@@ -219,6 +223,8 @@ impl ProxyHandler {
         }
         let mut inners = Vec::with_capacity(upstreams_cfg.len());
         for u in upstreams_cfg {
+            let tls = build_upstream_tls(&u.effective_tls(pool_tls))
+                .with_context(|| format!("upstream {:?}", u.url))?;
             inners.push(InnerProxyClient::new(
                 &u.url,
                 strip_prefix,
@@ -226,7 +232,7 @@ impl ProxyHandler {
                 scheme,
                 pool_idle_timeout_secs,
                 pool_max_idle,
-                skip_verify,
+                tls,
                 connect_timeout_secs,
                 grpc.as_ref(),
             )?);
@@ -522,33 +528,46 @@ fn content_length(headers: &hyper::HeaderMap) -> u64 {
 /// stall (slow accept(), TLS handshake delay) can never wedge real
 /// traffic on its connection pool.
 pub(crate) struct HttpHealthProber {
-    client: Client<HttpsConnector<HttpConnector>, UpstreamBody>,
+    /// One client per upstream URL.  A probe must verify the backend
+    /// with the same trust the real traffic uses, and that is
+    /// per-upstream since `upstream { tls { ... } }`.
+    clients: std::collections::HashMap<
+        String,
+        Client<HttpsConnector<HttpConnector>, UpstreamBody>,
+    >,
 }
 
 impl HttpHealthProber {
-    pub(crate) fn new(skip_verify: bool) -> anyhow::Result<Self> {
-        let mut http_conn = HttpConnector::new();
-        http_conn.enforce_http(false);
-        let builder = if skip_verify {
-            let crypto = rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(
-                    SkipServerVerification,
-                ))
-                .with_no_client_auth();
-            hyper_rustls::HttpsConnectorBuilder::new()
-                .with_tls_config(crypto)
-        } else {
-            hyper_rustls::HttpsConnectorBuilder::new().with_webpki_roots()
-        };
-        let connector = builder
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .wrap_connector(http_conn);
-        let client =
-            Client::builder(TokioExecutor::new()).build(connector);
-        Ok(HttpHealthProber { client })
+    /// `upstreams` pairs each upstream URL with its resolved TLS
+    /// settings (pool `tls` merged with the upstream's own).
+    pub(crate) fn new(
+        upstreams: &[crate::config::UpstreamConfig],
+        pool_tls: Option<&UpstreamTlsConfig>,
+    ) -> anyhow::Result<Self> {
+        let mut clients = std::collections::HashMap::new();
+        for u in upstreams {
+            let tls = build_upstream_tls(&u.effective_tls(pool_tls))
+                .with_context(|| format!("health probe for {:?}", u.url))?;
+            let mut http_conn = HttpConnector::new();
+            http_conn.enforce_http(false);
+            let builder = hyper_rustls::HttpsConnectorBuilder::new()
+                .with_tls_config((*tls.config).clone())
+                .https_or_http();
+            let builder = match &tls.server_name {
+                Some(name) => builder.with_server_name_resolver(
+                    hyper_rustls::FixedServerNameResolver::new(name.clone()),
+                ),
+                None => builder,
+            };
+            let connector = builder
+                .enable_http1()
+                .enable_http2()
+                .wrap_connector(http_conn);
+            let client =
+                Client::builder(TokioExecutor::new()).build(connector);
+            clients.insert(u.url.clone(), client);
+        }
+        Ok(HttpHealthProber { clients })
     }
 }
 
@@ -580,7 +599,14 @@ impl crate::lb::HealthProber for HttpHealthProber {
             Ok(r) => r,
             Err(_) => return false,
         };
-        let fut = self.client.request(req);
+        // Every URL the pool can hand us was registered in `new`;
+        // an unknown one is a programming error, reported as unhealthy
+        // rather than panicking inside the probe loop.
+        let Some(client) = self.clients.get(url) else {
+            tracing::error!(url, "health probe: no client for upstream");
+            return false;
+        };
+        let fut = client.request(req);
         match tokio::time::timeout(
             std::time::Duration::from_secs(cfg.timeout_secs.max(1)),
             fut,
@@ -727,60 +753,6 @@ pub(super) fn convert_response(resp: Response<Incoming>) -> HttpResponse {
 
 // -- Tests ---------------------------------------------------------
 
-/// Rustls verifier that accepts any server certificate.  Used by the
-/// `proxy { tls { skip-verify } }` opt-in for internal upstreams with
-/// self-signed certs, and by the test harness for the same reason
-/// against in-process listeners.  Operators explicitly opt in via
-/// config; this MUST NOT become the default.
-#[derive(Debug)]
-pub(super) struct SkipServerVerification;
-
-mod skip_verify_impl {
-    use super::SkipServerVerification;
-    use rustls::client::danger::{
-        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-    };
-    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use rustls::{DigitallySignedStruct, SignatureScheme};
-
-    impl ServerCertVerifier for SkipServerVerification {
-        fn verify_server_cert(
-            &self,
-            _: &CertificateDer<'_>,
-            _: &[CertificateDer<'_>],
-            _: &ServerName<'_>,
-            _: &[u8],
-            _: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            Ok(ServerCertVerified::assertion())
-        }
-        fn verify_tls12_signature(
-            &self,
-            _: &[u8],
-            _: &CertificateDer<'_>,
-            _: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-        fn verify_tls13_signature(
-            &self,
-            _: &[u8],
-            _: &CertificateDer<'_>,
-            _: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::ED25519,
-                SignatureScheme::RSA_PSS_SHA256,
-                SignatureScheme::RSA_PKCS1_SHA256,
-            ]
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,7 +797,7 @@ mod tests {
             crate::config::ProxyUpstreamScheme::Auto,
             None,
             None,
-            false,
+            None,
             None,
             None,
         )
@@ -1102,7 +1074,7 @@ mod tests {
             crate::config::ProxyUpstreamScheme::Auto,
             None,
         None,
-        false,
+        None,
         None,
         None,
         )
@@ -1193,7 +1165,7 @@ mod tests {
             crate::config::ProxyUpstreamScheme::Auto,
             None,
         None,
-        false,
+        None,
         None,
         None,
         )
@@ -1292,7 +1264,7 @@ mod tests {
             crate::config::ProxyUpstreamScheme::Auto,
             None,
         None,
-        false,
+        None,
         None,
         None,
         )
@@ -1586,11 +1558,13 @@ mod tests {
                     url: format!("http://{bad}"),
                     weight: 1,
                     group: None,
+                    tls: None,
                 },
                 crate::config::UpstreamConfig {
                     url: format!("http://{good}"),
                     weight: 1,
                     group: None,
+                    tls: None,
                 },
             ],
             crate::config::LbPolicy::RoundRobin,
@@ -1606,7 +1580,7 @@ mod tests {
             crate::config::ProxyUpstreamScheme::Auto,
             None,
             None,
-            false,
+            None,
             None,
             None,
             metrics.clone(),
@@ -1641,6 +1615,7 @@ mod tests {
                 url: format!("http://{bad}"),
                 weight: 1,
                 group: None,
+                tls: None,
             }],
             crate::config::LbPolicy::RoundRobin,
             None,
@@ -1655,7 +1630,7 @@ mod tests {
             crate::config::ProxyUpstreamScheme::Auto,
             None,
             None,
-            false,
+            None,
             None,
             None,
             metrics.clone(),
@@ -1691,6 +1666,7 @@ mod tests {
                 url: format!("http://{backend}"),
                 weight: 1,
                 group: None,
+                tls: None,
             }],
             crate::config::LbPolicy::RoundRobin,
             None,
@@ -1705,7 +1681,7 @@ mod tests {
             crate::config::ProxyUpstreamScheme::Auto,
             None,
             None,
-            false,
+            None,
             None,
             None,
             metrics.clone(),
@@ -1817,11 +1793,13 @@ mod tests {
                     url: format!("http://{bad}"),
                     weight: 1,
                     group: None,
+                    tls: None,
                 },
                 crate::config::UpstreamConfig {
                     url: format!("http://{good}"),
                     weight: 1,
                     group: None,
+                    tls: None,
                 },
             ],
             crate::config::LbPolicy::RoundRobin,
@@ -1837,7 +1815,7 @@ mod tests {
             crate::config::ProxyUpstreamScheme::Auto,
             None,
             None,
-            false,
+            None,
             None,
             None,
             metrics.clone(),
@@ -1880,11 +1858,13 @@ mod tests {
                     url: format!("http://{a}"),
                     weight: 1,
                     group: None,
+                    tls: None,
                 },
                 crate::config::UpstreamConfig {
                     url: format!("http://{b}"),
                     weight: 1,
                     group: None,
+                    tls: None,
                 },
             ],
             crate::config::LbPolicy::RoundRobin,
@@ -1900,7 +1880,7 @@ mod tests {
             crate::config::ProxyUpstreamScheme::Auto,
             None,
             None,
-            false,
+            None,
             None,
             None,
             metrics.clone(),
@@ -1952,11 +1932,13 @@ mod tests {
                     url: format!("http://{dead_addr}"),
                     weight: 1,
                     group: None,
+                    tls: None,
                 },
                 crate::config::UpstreamConfig {
                     url: format!("http://{good}"),
                     weight: 1,
                     group: None,
+                    tls: None,
                 },
             ],
             crate::config::LbPolicy::RoundRobin,
@@ -1973,7 +1955,7 @@ mod tests {
             crate::config::ProxyUpstreamScheme::Auto,
             None,
             None,
-            false,
+            None,
             None,
             None,
             metrics.clone(),
@@ -2019,10 +2001,19 @@ mod tests {
         }
     }
 
+    fn plain_upstream(addr: SocketAddr) -> crate::config::UpstreamConfig {
+        crate::config::UpstreamConfig {
+            url: format!("http://{addr}"),
+            weight: 1,
+            group: None,
+            tls: None,
+        }
+    }
+
     #[tokio::test]
     async fn http_health_prober_returns_true_for_expected_status() {
         let addr = spawn_mock(200).await;
-        let p = HttpHealthProber::new(false).unwrap();
+        let p = HttpHealthProber::new(&[plain_upstream(addr)], None).unwrap();
         let cfg = crate::config::ActiveHealthConfig {
             path: "/h".into(),
             interval_secs: 0,
@@ -2043,7 +2034,7 @@ mod tests {
     #[tokio::test]
     async fn http_health_prober_returns_false_for_wrong_status() {
         let addr = spawn_mock(500).await;
-        let p = HttpHealthProber::new(false).unwrap();
+        let p = HttpHealthProber::new(&[plain_upstream(addr)], None).unwrap();
         let cfg = crate::config::ActiveHealthConfig {
             path: "/h".into(),
             interval_secs: 0,
