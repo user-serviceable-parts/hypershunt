@@ -88,7 +88,7 @@ COPY packaging/oci/hypershunt-container.kdl /etc/hypershunt.kdl
 # via server.user in the config.  In rootless podman "root" inside the
 # container maps to the host user in the user namespace, not host root.
 LABEL org.opencontainers.image.description="HTTP/reverse-proxy server with TLS, virtual hosts, and static file serving"
-LABEL org.opencontainers.image.source="https://github.com/6d7770/hypershunt"
+LABEL org.opencontainers.image.source="https://github.com/user-serviceable-parts/hypershunt"
 LABEL org.opencontainers.image.licenses="BSD-2-Clause"
 
 EXPOSE 80 443

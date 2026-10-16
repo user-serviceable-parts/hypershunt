@@ -45,7 +45,7 @@ Configuration is written in KDL. The top-level nodes are:
 > **location**  
 > Maps a URL path prefix to a handler: **static**, **proxy**, **redirect**, **respond**, **fastcgi**, **scgi**, **cgi**, **status**, **metrics**, or **auth-request**.
 
-See the configuration reference for the full directive list: [](https://github.com/6d7770/hypershunt/blob/main/docs/reference.md)
+See the configuration reference for the full directive list: [](https://github.com/user-serviceable-parts/hypershunt/blob/main/docs/reference.md)
 
 # FILES
 
@@ -92,7 +92,7 @@ Run with debug logging enabled:
 
 **systemctl**(1)
 
-Documentation: [](https://github.com/6d7770/hypershunt/tree/main/docs) (**quickstart.md**, **guide.md**, **reference.md**, **grammar.md**).
+Documentation: [](https://github.com/user-serviceable-parts/hypershunt/tree/main/docs) (**quickstart.md**, **guide.md**, **reference.md**, **grammar.md**).
 
 # BUGS
 

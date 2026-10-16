@@ -44,4 +44,4 @@
   - [Troubleshooting](troubleshooting.md)
   - [Manual (man page)](manual.md)
 
-- [GitHub](https://github.com/6d7770/hypershunt)
+- [GitHub](https://github.com/user-serviceable-parts/hypershunt)

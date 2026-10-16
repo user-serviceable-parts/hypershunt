@@ -23,7 +23,7 @@ Formal KDL syntax for `hypershunt.kdl`.
 [**Server status →**](/status ':ignore')
 Live metrics for this hypershunt instance.
 
-[**GitHub →**](https://github.com/6d7770/hypershunt)
+[**GitHub →**](https://github.com/user-serviceable-parts/hypershunt)
 Source, issues, releases.
 
 </div>

@@ -15,7 +15,7 @@ The examples use `podman`; replace with `docker` (and drop the
 ## Serve the bundled documentation
 
 ```sh
-podman run --rm --pull=newer -p 8080:80 ghcr.io/6d7770/hypershunt:latest
+podman run --rm --pull=newer -p 8080:80 ghcr.io/user-serviceable-parts/hypershunt:latest
 ```
 
 (`--pull=newer` refreshes a previously cached `:latest` image; the
@@ -41,7 +41,7 @@ Bind-mount a host directory at `/var/www/hypershunt`:
 ```sh
 podman run --rm -p 8080:80 \
     -v "$PWD/public:/var/www/hypershunt:ro,Z" \
-    ghcr.io/6d7770/hypershunt:latest
+    ghcr.io/user-serviceable-parts/hypershunt:latest
 ```
 
 <!-- tab:docker -->
@@ -49,7 +49,7 @@ podman run --rm -p 8080:80 \
 ```sh
 docker run --rm -p 8080:80 \
     -v "$PWD/public:/var/www/hypershunt:ro" \
-    ghcr.io/6d7770/hypershunt:latest
+    ghcr.io/user-serviceable-parts/hypershunt:latest
 ```
 
 <!-- tabs:end -->
@@ -84,7 +84,7 @@ EOF
 podman run --rm -p 8080:80 \
     -v "$PWD/hypershunt.kdl:/etc/hypershunt.kdl:ro,Z" \
     -v "$PWD/public:/var/www/hypershunt:ro,Z" \
-    ghcr.io/6d7770/hypershunt:latest
+    ghcr.io/user-serviceable-parts/hypershunt:latest
 ```
 
 This vhost reverse-proxies `/api/` to a backend and serves
@@ -106,7 +106,7 @@ EOF
 podman run --rm -p 8443:443 \
     -v "$PWD/hypershunt.kdl:/etc/hypershunt.kdl:ro,Z" \
     -v "$PWD/public:/var/www/hypershunt:ro,Z" \
-    ghcr.io/6d7770/hypershunt:latest
+    ghcr.io/user-serviceable-parts/hypershunt:latest
 ```
 
 Open <https://localhost:8443>.  Your browser will warn about the
@@ -155,7 +155,7 @@ podman run -d --name hypershunt \
     -v "$PWD/hypershunt.kdl:/etc/hypershunt.kdl:ro,Z" \
     -v "$PWD/public:/var/www/hypershunt:ro,Z" \
     -v "hypershunt-state:/var/lib/hypershunt:Z" \
-    ghcr.io/6d7770/hypershunt:latest
+    ghcr.io/user-serviceable-parts/hypershunt:latest
 ```
 
 A few things changed:
@@ -241,7 +241,7 @@ Validate any config file before running:
 ```sh
 podman run --rm \
     -v "$PWD/hypershunt.kdl:/etc/hypershunt.kdl:ro,Z" \
-    ghcr.io/6d7770/hypershunt:latest \
+    ghcr.io/user-serviceable-parts/hypershunt:latest \
     --check-config
 ```
 

@@ -2614,7 +2614,7 @@ them into the host journal with the journald log driver:
 
 ```sh
 podman run -d --name hypershunt --log-driver journald \
-    -p 80:80 -p 443:443 ghcr.io/6d7770/hypershunt:latest
+    -p 80:80 -p 443:443 ghcr.io/user-serviceable-parts/hypershunt:latest
 ```
 
 The filter and jail files aren't installed by the image (there's no
