@@ -418,12 +418,52 @@ pub struct ProxyConfig {
     pub flow_idle_timeout_secs: Option<u64>,
 }
 
-/// TLS options for the upstream connection in stream proxy mode.
-#[derive(Debug, Clone)]
+/// TLS options for an upstream connection.  Used by the stream proxy,
+/// by the HTTP proxy pool (`proxy { tls { ... } }`) and by a single
+/// upstream inside that pool (`upstream "..." { tls { ... } }`), where
+/// it overrides the pool's settings field by field.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UpstreamTlsConfig {
     /// Skip certificate verification.  Only use for internal or dev
     /// upstreams with self-signed certificates.
     pub skip_verify: bool,
+    /// PEM bundle of CA certificates that *replaces* the public roots
+    /// for this upstream.  Already resolved relative to the config
+    /// file.  Read when the client is built, not at parse time.
+    pub ca_file: Option<String>,
+    /// Name sent as SNI and checked against the certificate, when the
+    /// address the upstream is reached at is not in its certificate.
+    /// Validated as a `rustls` `ServerName` at parse time.
+    pub server_name: Option<String>,
+}
+
+impl UpstreamTlsConfig {
+    /// `over` wins on every field it sets; unset fields fall back to
+    /// `self`.  Used to lay a per-upstream `tls` over the pool's.
+    pub fn merge(&self, over: &UpstreamTlsConfig) -> UpstreamTlsConfig {
+        UpstreamTlsConfig {
+            skip_verify: self.skip_verify || over.skip_verify,
+            ca_file: over.ca_file.clone().or_else(|| self.ca_file.clone()),
+            server_name: over
+                .server_name
+                .clone()
+                .or_else(|| self.server_name.clone()),
+        }
+    }
+
+    /// A trust setting next to `skip-verify` is a contradiction the
+    /// operator should resolve, not something to pick a winner for.
+    pub fn check_consistent(&self) -> Result<(), &'static str> {
+        if self.skip_verify && self.ca_file.is_some() {
+            return Err("skip-verify=#true and ca-file are contradictory");
+        }
+        if self.skip_verify && self.server_name.is_some() {
+            return Err(
+                "skip-verify=#true and server-name are contradictory",
+            );
+        }
+        Ok(())
+    }
 }
 
 /// DTLS options for the upstream connection in datagram proxy mode.
@@ -528,6 +568,25 @@ pub struct UpstreamConfig {
     /// template.  `None` means the upstream belongs to no group and
     /// is only picked when no group restriction applies.
     pub group: Option<String>,
+    /// Per-upstream TLS settings, laid over the pool's `tls` block.
+    pub tls: Option<UpstreamTlsConfig>,
+}
+
+impl UpstreamConfig {
+    /// The TLS settings this upstream actually connects with: the
+    /// pool's `tls` block with the upstream's own laid over it.
+    /// Neither present gives the defaults (public roots, URL host).
+    pub fn effective_tls(
+        &self,
+        pool: Option<&UpstreamTlsConfig>,
+    ) -> UpstreamTlsConfig {
+        match (pool, &self.tls) {
+            (None, None) => UpstreamTlsConfig::default(),
+            (Some(p), None) => p.clone(),
+            (None, Some(o)) => o.clone(),
+            (Some(p), Some(o)) => p.merge(o),
+        }
+    }
 }
 
 /// Picker policy for multi-upstream proxy locations.

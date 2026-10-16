@@ -13,6 +13,7 @@ use crate::access::{
 use crate::config::ListenerConfig;
 use crate::geoip;
 use crate::metrics::Metrics;
+use crate::upstream_tls::UpstreamTls;
 use crate::proxy_proto;
 use arc_swap::ArcSwap;
 use std::net::SocketAddr;
@@ -146,7 +147,7 @@ pub async fn run_stream_proxy(
     cfg: ListenerConfig,
     listener: BoundSocket,
     acceptor: Option<Arc<ArcSwap<TlsAcceptor>>>,
-    upstream_tls: Option<Arc<rustls::ClientConfig>>,
+    upstream_tls: Option<UpstreamTls>,
     mut shutdown: watch::Receiver<bool>,
     mut stop_accept: watch::Receiver<bool>,
     access: Option<Arc<PolicyBlock>>,
@@ -317,7 +318,7 @@ pub async fn run_stream_proxy(
 struct StreamProxyTarget {
     upstream: crate::config::BoundAddr,
     proxy_protocol: Option<crate::config::ProxyProtocolVersion>,
-    upstream_tls: Option<Arc<rustls::ClientConfig>>,
+    upstream_tls: Option<UpstreamTls>,
     local_addr: Option<SocketAddr>,
     // Our listener's Unix socket path — only used to populate the
     // PROXY v2 dst address when the client connects over Unix.
@@ -379,14 +380,18 @@ where
                         return Ok(());
                     }
                 };
-                if let Some(tls_cfg) = &target.upstream_tls {
-                    let server_name =
+                if let Some(tls) = &target.upstream_tls {
+                    // A Unix socket has no address to name the peer
+                    // by, so without `server-name` the conventional
+                    // `localhost` stands in.
+                    let server_name = tls.server_name_or(
                         rustls::pki_types::ServerName::try_from(
                             "localhost",
                         )
-                        .unwrap();
+                        .expect("static name is valid"),
+                    );
                     let connector = tokio_rustls::TlsConnector::from(
-                        tls_cfg.clone(),
+                        tls.config.clone(),
                     );
                     match connector.connect(server_name, raw).await {
                         Ok(s) => BackendStream::TlsUnix(Box::new(s)),
@@ -481,7 +486,7 @@ where
 // upstream unavailability as an error.
 async fn connect_tcp_upstream(
     upstream: SocketAddr,
-    upstream_tls: &Option<Arc<rustls::ClientConfig>>,
+    upstream_tls: &Option<UpstreamTls>,
     peer_addr: PeerAddr,
 ) -> anyhow::Result<Option<BackendStream>> {
     let tcp = match tokio::net::TcpStream::connect(upstream).await {
@@ -495,16 +500,15 @@ async fn connect_tcp_upstream(
             return Ok(None);
         }
     };
-    if let Some(tls_cfg) = upstream_tls {
-        // ServerName derived from the upstream's IP: rustls accepts
-        // an IP-form ServerName, but most certificates aren't issued
-        // for IPs.  Operators who need hostname SNI today should use
-        // the HTTP reverse-proxy handler; the raw L4 stream proxy
-        // assumes IP-pinned upstreams.
-        let server_name = rustls::pki_types::ServerName::IpAddress(
-            upstream.ip().into(),
+    if let Some(tls) = upstream_tls {
+        // The upstream is known only by address here, so without
+        // `server-name` the IP is the only name there is to verify
+        // against.  Most certificates are not issued for IPs; the
+        // override exists for exactly that case.
+        let server_name = tls.server_name_or(
+            rustls::pki_types::ServerName::IpAddress(upstream.ip().into()),
         );
-        let connector = tokio_rustls::TlsConnector::from(tls_cfg.clone());
+        let connector = tokio_rustls::TlsConnector::from(tls.config.clone());
         match connector.connect(server_name, tcp).await {
             Ok(s) => Ok(Some(BackendStream::TlsTcp(Box::new(s)))),
             Err(e) => {

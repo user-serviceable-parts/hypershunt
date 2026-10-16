@@ -175,10 +175,18 @@ fn parse_proxy(
                     node_line(src, child)
                 );
             }
+            let tls = child
+                .children()
+                .and_then(|d| {
+                    d.nodes().iter().find(|n| n.name().value() == "tls")
+                })
+                .map(|t| parse_upstream_tls(t, src, name))
+                .transpose()?;
             upstreams.push(crate::config::UpstreamConfig {
                 url,
                 weight,
                 group,
+                tls,
             });
         }
     }
@@ -231,33 +239,41 @@ fn parse_proxy(
     let pool_max_idle = prop_i64(node, "pool-max-idle").map(|n| n as u32);
     let connect_timeout_secs =
         prop_i64(node, "connect-timeout").map(|n| n as u64);
-    // `tls skip-verify=#true` applies to every https upstream in the
-    // pool.  Presence with no skip-verify still implies "use TLS but
-    // verify certs" (the default would do that anyway, so the node is
-    // essentially a marker).
+    // The pool's `tls` block is the default for every upstream; an
+    // upstream's own `tls` child is laid over it.  A bare `tls` node
+    // still means "use TLS but verify", so it is essentially a marker.
     let upstream_tls: Option<UpstreamTlsConfig> = node
         .children()
         .and_then(|doc| {
             doc.nodes().iter().find(|n| n.name().value() == "tls")
         })
-        .map(|tls_node| -> anyhow::Result<UpstreamTlsConfig> {
-            let skip_verify =
-                prop_bool(tls_node, "skip-verify").unwrap_or(false);
-            if skip_verify {
-                for u in &upstreams {
-                    if !u.url.starts_with("https://") {
-                        bail!(
-                            "{name}:{line}: proxy 'tls skip-verify' is \
-                             only meaningful for https:// upstreams \
-                             (got {:?})",
-                            u.url
-                        );
-                    }
-                }
-            }
-            Ok(UpstreamTlsConfig { skip_verify })
-        })
+        .map(|t| parse_upstream_tls(t, src, name))
         .transpose()?;
+    // Trust settings only mean something when there is a TLS
+    // handshake to apply them to, so check the merged result of each
+    // upstream against its scheme.
+    for u in &upstreams {
+        if upstream_tls.is_none() && u.tls.is_none() {
+            continue;
+        }
+        let eff = u.effective_tls(upstream_tls.as_ref());
+        eff.check_consistent().map_err(|m| {
+            anyhow!(
+                "{name}:{line}: proxy tls for upstream {:?}: {m}",
+                u.url
+            )
+        })?;
+        let touches_trust = eff.skip_verify
+            || eff.ca_file.is_some()
+            || eff.server_name.is_some();
+        if touches_trust && !u.url.starts_with("https://") {
+            bail!(
+                "{name}:{line}: proxy tls settings are only meaningful \
+                 for https:// upstreams (got {:?})",
+                u.url
+            );
+        }
+    }
     // `lb-policy "<kind>"` -- positional kind, optional `header=` for
     // header-hash only.
     let lb_node = node.children().and_then(|d| {
@@ -600,7 +616,7 @@ fn parse_respond(
 /// parser (empty under `Config::parse` in tests).  Absolute paths and
 /// the empty-`name` case pass through unchanged so absolute paths and
 /// inline test configs behave intuitively.
-fn resolve_config_relative(name: &str, path: &str) -> String {
+pub(super) fn resolve_config_relative(name: &str, path: &str) -> String {
     let p = std::path::Path::new(path);
     if p.is_absolute() || name.is_empty() {
         return path.to_owned();
@@ -611,6 +627,65 @@ fn resolve_config_relative(name: &str, path: &str) -> String {
         }
         _ => path.to_owned(),
     }
+}
+
+/// Parse an upstream `tls` node:
+///
+/// ```kdl
+/// tls skip-verify=#true
+/// tls { ca-file "pki/ca.pem"; server-name "api.internal" }
+/// ```
+///
+/// Shared by the HTTP proxy pool, a single `upstream` inside it, and
+/// the stream-mode `proxy`, so all three accept the same shape.  A
+/// bare `tls` node means "TLS with the public roots".
+pub(super) fn parse_upstream_tls(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+) -> anyhow::Result<UpstreamTlsConfig> {
+    let line = node_line(src, node);
+    let skip_verify = prop_bool(node, "skip-verify").unwrap_or(false);
+    let mut ca_file = None;
+    let mut server_name = None;
+    for child in node.children().map(|d| d.nodes()).unwrap_or_default() {
+        let cl = node_line(src, child);
+        match child.name().value() {
+            "ca-file" => {
+                let f = req_arg_str(child, 0).with_context(|| {
+                    format!("{name}:{cl}: tls ca-file requires a path")
+                })?;
+                ca_file = Some(resolve_config_relative(name, &f));
+            }
+            "server-name" => {
+                let n = req_arg_str(child, 0).with_context(|| {
+                    format!("{name}:{cl}: tls server-name requires a name")
+                })?;
+                // Reject now what rustls would reject at connect
+                // time, when the error would be far from its cause.
+                rustls::pki_types::ServerName::try_from(n.as_str())
+                    .map_err(|e| {
+                        anyhow!(
+                            "{name}:{cl}: tls server-name {n:?} is not \
+                             a valid DNS name or IP address: {e}"
+                        )
+                    })?;
+                server_name = Some(n);
+            }
+            other => bail!(
+                "{name}:{cl}: unknown node '{other}' in tls \
+                 (expected ca-file or server-name)"
+            ),
+        }
+    }
+    let cfg = UpstreamTlsConfig {
+        skip_verify,
+        ca_file,
+        server_name,
+    };
+    cfg.check_consistent()
+        .map_err(|m| anyhow!("{name}:{line}: tls: {m}"))?;
+    Ok(cfg)
 }
 
 #[cfg(test)]

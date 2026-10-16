@@ -38,6 +38,7 @@ mod reload;
 mod router;
 mod security;
 mod task;
+mod upstream_tls;
 #[cfg(test)]
 mod test;
 mod vars;

@@ -111,6 +111,38 @@ vhost "app.example.com" {
 [Load balancing](guide.md#load-balancing),
 [Health checks](guide.md#health-checks).
 
+## Backends behind a private CA
+
+Verify internal HTTPS backends against your own CA instead of
+switching verification off.  The pool trusts the internal CA; one
+backend is reached by IP and needs the certificate's name supplied.
+
+```kdl
+server user="hypershunt" state-dir="/var/lib/hypershunt"
+
+listener "tcp://[::]:443" {
+    tls "acme" email="ops@example.com" { domain "app.example.com" }
+}
+
+vhost "app.example.com" {
+    location "/" {
+        proxy {
+            tls { ca-file "/etc/hypershunt/pki/internal-ca.pem" }
+            upstream "https://api-1.internal:8443"
+            upstream "https://10.0.0.12:8443" {
+                tls { server-name "api-2.internal" }
+            }
+        }
+    }
+}
+```
+
+Active health checks use the same trust settings as the requests, so
+a probe does not fail where traffic would succeed.
+
+**See also:** [Upstream TLS trust](guide.md#upstream-tls-trust),
+[`tls` (proxy upstream)](reference.md#tls-proxy-upstream).
+
 ## Canary lane and per-region headers with variables
 
 Route opted-in clients (an `X-Lane: beta` header) to a canary
@@ -357,11 +389,21 @@ To terminate TLS at the edge and re-originate it to the backend:
 listener "tcp://0.0.0.0:5432" {
     tls "files" cert="/etc/hypershunt/edge.pem" \
             key="/etc/hypershunt/edge.key"
-    proxy "tcp://10.0.0.5:5432" { tls skip-verify=#false }
+    proxy "tcp://10.0.0.5:5432" {
+        tls {
+            ca-file "/etc/hypershunt/pki/internal-ca.pem"
+            server-name "db.internal"
+        }
+    }
 }
 ```
 
-**See also:** [Layer-4 proxy](guide.md#layer-4-proxy).
+`server-name` is what makes verification work here: the stream
+proxy only knows the backend's IP, and the certificate names
+`db.internal`.
+
+**See also:** [Layer-4 proxy](guide.md#layer-4-proxy),
+[`tls` (upstream)](reference.md#tls-upstream).
 
 ## Behind another reverse proxy (PROXY protocol)
 

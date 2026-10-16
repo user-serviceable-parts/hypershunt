@@ -4,9 +4,10 @@
 
 use super::H3Client;
 use super::super::proxy::{
-    ProxyClient, SkipServerVerification, UpstreamBody, build_backend_uri,
-    convert_response, set_forwarding_headers, strip_hop_by_hop,
+    ProxyClient, UpstreamBody, build_backend_uri, convert_response,
+    set_forwarding_headers, strip_hop_by_hop,
 };
+use crate::upstream_tls::UpstreamTls;
 #[cfg(unix)]
 use super::super::proxy::UnixConnector;
 use crate::config::ProxyProtocolVersion;
@@ -17,7 +18,6 @@ use hyper::body::Incoming;
 use hyper::header::HeaderValue;
 use hyper::{Request, Response, Uri, Version};
 use http_body_util::BodyExt;
-use hyper_rustls::ConfigBuilderExt;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -95,7 +95,7 @@ pub(crate) struct InnerProxyClient {
 #[derive(Clone)]
 struct H3LazyParams {
     upstream: Uri,
-    skip_verify: bool,
+    tls: UpstreamTls,
     pool_idle: Option<std::time::Duration>,
     connect_timeout: Option<std::time::Duration>,
 }
@@ -164,7 +164,7 @@ impl InnerProxyClient {
         scheme: crate::config::ProxyUpstreamScheme,
         pool_idle_timeout_secs: Option<u64>,
         pool_max_idle: Option<u32>,
-        skip_verify: bool,
+        tls: UpstreamTls,
         connect_timeout_secs: Option<u64>,
         grpc: Option<&crate::config::GrpcConfig>,
     ) -> anyhow::Result<Self> {
@@ -241,7 +241,7 @@ impl InnerProxyClient {
                     upstream: "http://localhost"
                         .parse()
                         .expect("static URI is valid"),
-                    skip_verify: false,
+                    tls,
                     pool_idle,
                     connect_timeout,
                 },
@@ -269,11 +269,7 @@ impl InnerProxyClient {
         }
         // H3: route through quinn instead of the h1/h2 hyper-util Client.
         if scheme == crate::config::ProxyUpstreamScheme::H3 {
-            let mut h3 = if skip_verify {
-                H3Client::new_skip_verify(&upstream, pool_idle)?
-            } else {
-                H3Client::new(&upstream, pool_idle)?
-            };
+            let mut h3 = H3Client::new(&upstream, &tls, pool_idle)?;
             h3.connect_timeout = connect_timeout;
             return Ok(Self {
                 client: ProxyClient::H3(h3),
@@ -287,7 +283,7 @@ impl InnerProxyClient {
                 h3_lazy: Arc::new(tokio::sync::Mutex::new(None)),
                 h3_params: H3LazyParams {
                     upstream,
-                    skip_verify,
+                    tls,
                     pool_idle,
                     connect_timeout,
                 },
@@ -302,33 +298,28 @@ impl InnerProxyClient {
         // Both ALPN protocols are enabled so https:// upstreams that
         // advertise h2 get HTTP/2 (with multiplexing + header
         // compression), and h1-only backends fall back transparently.
-        // When the operator opted into skip-verify (internal upstream
-        // with a self-signed cert), build a rustls ClientConfig with
-        // the permissive verifier instead of webpki roots.
         let mut http_conn = HttpConnector::new();
         http_conn.enforce_http(false); // allow https URIs
         if let Some(d) = connect_timeout {
             http_conn.set_connect_timeout(Some(d));
         }
-        let https_builder = if skip_verify {
-            // Don't set alpn_protocols here: hyper-rustls 0.27's
-            // `with_tls_config` panics if ALPN is pre-populated.
-            // The builder injects the right ALPN list based on the
-            // subsequent `enable_http1()` / `enable_http2()` calls.
-            let crypto = rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(
-                    SkipServerVerification,
-                ))
-                .with_no_client_auth();
-            hyper_rustls::HttpsConnectorBuilder::new()
-                .with_tls_config(crypto)
-        } else {
-            hyper_rustls::HttpsConnectorBuilder::new()
-                .with_webpki_roots()
+        // Don't set alpn_protocols on the config: hyper-rustls 0.27's
+        // `with_tls_config` panics if ALPN is pre-populated.  The
+        // builder injects the right ALPN list based on the
+        // subsequent `enable_http1()` / `enable_http2()` calls.
+        let https_builder = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config((*tls.config).clone())
+            .https_or_http();
+        // A `server-name` override replaces the name hyper-rustls
+        // would otherwise take from the request URI, for both SNI and
+        // certificate verification.  DNS still resolves the URI host.
+        let https_builder = match &tls.server_name {
+            Some(name) => https_builder.with_server_name_resolver(
+                hyper_rustls::FixedServerNameResolver::new(name.clone()),
+            ),
+            None => https_builder,
         };
         let connector = https_builder
-            .https_or_http()
             .enable_http1()
             .enable_http2()
             .wrap_connector(http_conn);
@@ -349,7 +340,7 @@ impl InnerProxyClient {
             h3_lazy: Arc::new(tokio::sync::Mutex::new(None)),
             h3_params: H3LazyParams {
                 upstream,
-                skip_verify,
+                tls,
                 pool_idle,
                 connect_timeout,
             },
@@ -788,15 +779,12 @@ impl InnerProxyClient {
             let alt_url = format!("https://{host}:{port}/")
                 .parse::<Uri>()
                 .ok()?;
-            let mut h3 = if self.h3_params.skip_verify {
-                H3Client::new_skip_verify(
-                    &alt_url,
-                    self.h3_params.pool_idle,
-                )
-                .ok()?
-            } else {
-                H3Client::new(&alt_url, self.h3_params.pool_idle).ok()?
-            };
+            let mut h3 = H3Client::new(
+                &alt_url,
+                &self.h3_params.tls,
+                self.h3_params.pool_idle,
+            )
+            .ok()?;
             h3.connect_timeout = self.h3_params.connect_timeout;
             *lazy = Some(Arc::new(h3));
         }
@@ -955,7 +943,7 @@ impl InnerProxyClient {
 
         let resp = if self.upstream.scheme_str() == Some("https") {
             let host = self.upstream.host().unwrap_or("");
-            let server_name = match rustls::pki_types::ServerName::try_from(
+            let from_url = match rustls::pki_types::ServerName::try_from(
                 host.to_owned(),
             ) {
                 Ok(n) => n,
@@ -966,14 +954,15 @@ impl InnerProxyClient {
                     return response_502();
                 }
             };
-            let tls_cfg = Arc::new(
-                rustls::ClientConfig::builder()
-                    .with_webpki_roots()
-                    .with_no_client_auth(),
-            );
-            let tls_stream = match tokio_rustls::TlsConnector::from(tls_cfg)
-                .connect(server_name, stream)
-                .await
+            // Same trust settings as the pooled client, so an
+            // upstream behind a private CA works with or without
+            // `proxy-protocol=`.
+            let tls = &self.h3_params.tls;
+            let server_name = tls.server_name_or(from_url);
+            let tls_stream =
+                match tokio_rustls::TlsConnector::from(tls.config.clone())
+                    .connect(server_name, stream)
+                    .await
             {
                 Ok(s) => s,
                 Err(e) => {
@@ -1040,7 +1029,8 @@ mod tests {
             crate::config::ProxyUpstreamScheme::Auto,
             None,
             None,
-            false,
+            crate::upstream_tls::build_upstream_tls(&Default::default())
+                .expect("default trust builds"),
             None,
             None,
         )

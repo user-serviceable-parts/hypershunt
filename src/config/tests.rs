@@ -3415,3 +3415,294 @@ fn tracing_rejects_unknown_child_with_suggestion() {
     assert!(err.contains("headers"), "{err}");
     assert!(err.contains("header"), "{err}");
 }
+
+// -- upstream tls: ca-file / server-name ---------------------------------
+
+fn proxy_pool_upstreams(cfg: &Config) -> &[UpstreamConfig] {
+    match &cfg.vhosts[0].locations[0].handler {
+        HandlerConfig::Proxy { upstreams, .. } => upstreams,
+        _ => panic!("expected Proxy handler"),
+    }
+}
+
+fn proxy_pool_tls(cfg: &Config) -> Option<&UpstreamTlsConfig> {
+    match &cfg.vhosts[0].locations[0].handler {
+        HandlerConfig::Proxy { upstream_tls, .. } => upstream_tls.as_ref(),
+        _ => panic!("expected Proxy handler"),
+    }
+}
+
+#[test]
+fn proxy_pool_tls_children_parse() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/" {
+                proxy {
+                    tls {
+                        ca-file "/pki/ca.pem"
+                        server-name "api.internal"
+                    }
+                    upstream "https://10.0.0.5:8443"
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    let tls = proxy_pool_tls(&cfg).unwrap();
+    assert!(!tls.skip_verify);
+    assert_eq!(tls.ca_file.as_deref(), Some("/pki/ca.pem"));
+    assert_eq!(tls.server_name.as_deref(), Some("api.internal"));
+}
+
+#[test]
+fn proxy_pool_tls_ca_file_is_config_relative() {
+    let cfg = Config::parse_named(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/" {
+                proxy {
+                    tls { ca-file "pki/ca.pem" }
+                    upstream "https://10.0.0.5:8443"
+                }
+            }
+        }
+        "#,
+        "/etc/hypershunt/site.kdl",
+    )
+    .unwrap();
+    assert_eq!(
+        proxy_pool_tls(&cfg).unwrap().ca_file.as_deref(),
+        Some("/etc/hypershunt/pki/ca.pem")
+    );
+}
+
+#[test]
+fn per_upstream_tls_merges_over_pool_tls() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/" {
+                proxy {
+                    tls { ca-file "/pki/ca.pem" }
+                    upstream "https://10.0.0.5:8443" {
+                        tls { server-name "api.internal" }
+                    }
+                    upstream "https://10.0.0.6:8443"
+                    upstream "https://legacy:8443" {
+                        tls { ca-file "/pki/legacy.pem" }
+                    }
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    let pool = proxy_pool_tls(&cfg);
+    let ups = proxy_pool_upstreams(&cfg);
+    let eff: Vec<UpstreamTlsConfig> =
+        ups.iter().map(|u| u.effective_tls(pool)).collect();
+    // Override adds a name and keeps the pool's CA.
+    assert_eq!(eff[0].ca_file.as_deref(), Some("/pki/ca.pem"));
+    assert_eq!(eff[0].server_name.as_deref(), Some("api.internal"));
+    // Nothing of its own: inherits the pool verbatim.
+    assert_eq!(eff[1], pool.unwrap().clone());
+    // A different CA replaces the pool's for that upstream only.
+    assert_eq!(eff[2].ca_file.as_deref(), Some("/pki/legacy.pem"));
+    assert!(eff[2].server_name.is_none());
+}
+
+#[test]
+fn upstream_tls_without_pool_tls_stands_alone() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/" {
+                proxy {
+                    upstream "https://10.0.0.5:8443" {
+                        tls { server-name "api.internal" }
+                    }
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    assert!(proxy_pool_tls(&cfg).is_none());
+    let eff = proxy_pool_upstreams(&cfg)[0].effective_tls(None);
+    assert_eq!(eff.server_name.as_deref(), Some("api.internal"));
+    assert!(eff.ca_file.is_none());
+}
+
+#[test]
+fn upstream_tls_skip_verify_with_ca_file_is_rejected() {
+    let err = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/" {
+                proxy {
+                    tls skip-verify=#true { ca-file "/pki/ca.pem" }
+                    upstream "https://10.0.0.5:8443"
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("contradictory"), "{err}");
+}
+
+#[test]
+fn upstream_tls_skip_verify_across_levels_is_rejected() {
+    // Pool says skip, upstream says verify against a name: the merged
+    // result is the same contradiction, caught after merging.
+    let err = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/" {
+                proxy {
+                    tls skip-verify=#true
+                    upstream "https://10.0.0.5:8443" {
+                        tls { server-name "api.internal" }
+                    }
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("contradictory"), "{err}");
+    assert!(err.contains("10.0.0.5"), "{err}");
+}
+
+#[test]
+fn upstream_tls_bad_server_name_is_rejected() {
+    let err = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/" {
+                proxy {
+                    tls { server-name "not a name" }
+                    upstream "https://10.0.0.5:8443"
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("server-name"), "{err}");
+}
+
+#[test]
+fn upstream_tls_ip_server_name_is_accepted() {
+    Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/" {
+                proxy {
+                    tls { server-name "10.0.0.9" }
+                    upstream "https://backend.internal:8443"
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn upstream_tls_unknown_child_is_rejected() {
+    let err = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/" {
+                proxy {
+                    tls { ca_file "/pki/ca.pem" }
+                    upstream "https://10.0.0.5:8443"
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("unknown node 'ca_file'"), "{err}");
+}
+
+#[test]
+fn upstream_tls_trust_on_plain_http_upstream_is_rejected() {
+    let err = Config::parse(
+        r#"
+        listener "tcp://0.0.0.0:80"
+        vhost "h" {
+            location "/" {
+                proxy {
+                    upstream "http://10.0.0.5:8080" {
+                        tls { ca-file "/pki/ca.pem" }
+                    }
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("only meaningful for https"), "{err}");
+}
+
+#[test]
+fn listener_proxy_upstream_tls_children_parse() {
+    let cfg = Config::parse(
+        r#"
+        listener "tcp://[::]:5432" {
+            proxy "tcp://127.0.0.1:5432" {
+                tls {
+                    ca-file "/pki/ca.pem"
+                    server-name "db.internal"
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    let ut = cfg.listeners[0]
+        .proxy
+        .as_ref()
+        .unwrap()
+        .upstream_tls
+        .as_ref()
+        .unwrap();
+    assert_eq!(ut.ca_file.as_deref(), Some("/pki/ca.pem"));
+    assert_eq!(ut.server_name.as_deref(), Some("db.internal"));
+}
+
+#[test]
+fn upstream_tls_merge_prefers_override_fields() {
+    let pool = UpstreamTlsConfig {
+        skip_verify: false,
+        ca_file: Some("/a.pem".into()),
+        server_name: Some("a".into()),
+    };
+    let over = UpstreamTlsConfig {
+        skip_verify: false,
+        ca_file: None,
+        server_name: Some("b".into()),
+    };
+    let m = pool.merge(&over);
+    assert_eq!(m.ca_file.as_deref(), Some("/a.pem"));
+    assert_eq!(m.server_name.as_deref(), Some("b"));
+    assert!(!m.skip_verify);
+}

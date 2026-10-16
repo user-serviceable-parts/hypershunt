@@ -4,7 +4,7 @@ use super::{
     GeoIpConfig, HeaderOpConfig, HealthConfig, ListenerConfig,
     LocationConfig, ProxyConfig, ProxyProtocolVersion,
     ServerConfig, SocketKind, Timeouts,
-    UpstreamDtlsConfig, UpstreamTlsConfig, VHostConfig, VHostName,
+    UpstreamDtlsConfig, VHostConfig, VHostName,
 };
 use ::kdl::{KdlDocument, KdlNode};
 use anyhow::{Context, anyhow, bail};
@@ -700,10 +700,8 @@ pub(super) fn parse_listener(
         let upstream_tls = proxy_children
             .iter()
             .find(|n| n.name().value() == "tls")
-            .map(|tls_node| UpstreamTlsConfig {
-                skip_verify: prop_bool(tls_node, "skip-verify")
-                    .unwrap_or(false),
-            });
+            .map(|t| handler::parse_upstream_tls(t, src, name))
+            .transpose()?;
         // `dtls` upstream block: reserved syntactically.  Carry an
         // empty UpstreamDtlsConfig so validate() can bail with "not
         // yet implemented" downstream.
