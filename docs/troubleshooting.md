@@ -151,4 +151,4 @@ under Docker, where SELinux isn't enforcing.
 ## Still stuck?
 
 Re-run with verbose logging, capture the first error, and open an issue
-at <https://github.com/6d7770/hypershunt>.
+at <https://github.com/user-serviceable-parts/hypershunt>.

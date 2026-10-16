@@ -7,9 +7,9 @@ description = "HTTP server and reverse proxy"
 authors = ["Michael Paddon <michael@paddon.org>"]
 license = "BSD-2-Clause"
 readme = "README.md"
-repository = "https://github.com/6d7770/hypershunt"
-homepage = "https://github.com/6d7770/hypershunt"
-documentation = "https://github.com/6d7770/hypershunt/tree/main/docs"
+repository = "https://github.com/user-serviceable-parts/hypershunt"
+homepage = "https://github.com/user-serviceable-parts/hypershunt"
+documentation = "https://github.com/user-serviceable-parts/hypershunt/tree/main/docs"
 keywords = ["http", "reverse-proxy", "server", "tls", "http3"]
 categories = ["network-programming", "web-programming::http-server"]
 # Only source needed to build the binary ships in the published crate;

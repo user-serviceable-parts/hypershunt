@@ -5,8 +5,8 @@
   Written in Rust for memory safety.</p>
 
   <p>
-  <a href="https://github.com/6d7770/hypershunt/actions/workflows/build.yml"><img src="https://github.com/6d7770/hypershunt/actions/workflows/build.yml/badge.svg" alt="build"></a>
-  <a href="https://github.com/6d7770/hypershunt/releases"><img src="https://img.shields.io/github/v/release/6d7770/hypershunt?include_prereleases" alt="release"></a>
+  <a href="https://github.com/user-serviceable-parts/hypershunt/actions/workflows/build.yml"><img src="https://github.com/user-serviceable-parts/hypershunt/actions/workflows/build.yml/badge.svg" alt="build"></a>
+  <a href="https://github.com/user-serviceable-parts/hypershunt/releases"><img src="https://img.shields.io/github/v/release/user-serviceable-parts/hypershunt?include_prereleases" alt="release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSD--2--Clause-blue" alt="license"></a>
   </p>
 </div>
@@ -47,7 +47,7 @@ Or try it in one line, no root required — the container serves its own
 documentation out of the box:
 
 ```sh
-podman run --rm --pull=newer -p 8080:80 -p 8443:443 ghcr.io/6d7770/hypershunt:latest
+podman run --rm --pull=newer -p 8080:80 -p 8443:443 ghcr.io/user-serviceable-parts/hypershunt:latest
 ```
 
 Open <http://localhost:8080> (or <https://localhost:8443> with the
@@ -100,7 +100,7 @@ ephemeral self-signed certificate), then walk through the
 
 ## Install
 
-Every [release](https://github.com/6d7770/hypershunt/releases)
+Every [release](https://github.com/user-serviceable-parts/hypershunt/releases)
 ships `.deb` and `.rpm` packages:
 
 | Package | OS family | Architectures |
