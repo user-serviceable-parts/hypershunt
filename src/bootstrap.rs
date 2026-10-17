@@ -148,6 +148,8 @@ async fn build_cert_source_from_source(
             retry_interval_secs,
             challenge,
             dns_provider,
+            profile,
+            renew_before_secs,
         } => {
             let sd = state_dir
                 .expect("state_dir required for ACME (validated earlier)");
@@ -175,6 +177,8 @@ async fn build_cert_source_from_source(
                 cert_key_mode,
                 challenge: *challenge,
                 dns_provider: dns_provider.clone(),
+                profile: profile.clone(),
+                renew_before: renew_before_secs.map(Duration::from_secs),
             };
             let mgr = Arc::new(
                 match alpn_store.clone() {

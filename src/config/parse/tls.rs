@@ -87,7 +87,10 @@ fn parse_tls_node(
             // they appear as properties or as children) so a
             // misplaced cert path doesn't get silently ignored.
             for forbidden in
-                ["cert", "key", "name", "domain", "email", "staging"]
+                [
+                    "cert", "key", "name", "domain", "email", "staging",
+                    "profile", "renew-before",
+                ]
             {
                 if node.get(forbidden).is_some() {
                     bail!(
@@ -206,6 +209,12 @@ fn parse_tls_acme(
             }
         );
     }
+    let profile = prop_str(node, "profile");
+    if profile.as_deref().is_some_and(|p| p.trim().is_empty()) {
+        bail!("{name}:{line}: 'profile' must not be empty");
+    }
+    let renew_before_secs = super::parse_duration_prop(node, "renew-before")
+        .map_err(|e| anyhow!("{name}:{line}: {e}"))?;
     Ok(TlsConfig::Acme {
         domains,
         name: prop_str(node, "name"),
@@ -217,6 +226,8 @@ fn parse_tls_acme(
             .unwrap_or(3600),
         challenge,
         dns_provider,
+        profile,
+        renew_before_secs,
     })
 }
 

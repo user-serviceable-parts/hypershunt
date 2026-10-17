@@ -533,6 +533,40 @@ hypershunt only re-issues when the stored cert nears expiry.  For
 a custom or private ACME CA (step-ca, smallstep), point
 [`server=`](reference.md#server-acme) at its directory URL instead.
 
+### Short-lived certificates
+
+CAs that implement ACME profiles let the client choose a
+certificate lifetime at order time.  Pick one with
+[`profile`](reference.md#profile); Let's Encrypt advertises
+`"shortlived"` (about six days) alongside the default
+`"classic"` (90 days):
+
+```kdl
+listener "tcp://[::]:443" {
+    tls "acme" email="ops@example.com" profile="shortlived" {
+        domain "example.com"
+    }
+}
+```
+
+Nothing else changes.  Renewal timing follows the issued
+certificate: by default hypershunt renews when a third of the
+validity remains (capped at 30 days), so a six-day certificate is
+renewed two days before expiry and a 90-day one 30 days before,
+exactly as before.  Set
+[`renew-before`](reference.md#renew-before) to move that point,
+for example `renew-before="36h"` for more headroom, or a longer
+window on long-lived certificates if your CA is sometimes slow.
+A misconfigured `profile` fails at startup with the CA's
+advertised names, so a typo cannot silently fall back to the
+default lifetime.
+
+Short-lived certificates make the renewal path load-bearing:
+a CA or network outage lasting longer than the renewal window
+takes the site down.  Keep [`retry-interval`](reference.md#retry-interval)
+well below the window and watch the status page's next-renewal
+column.
+
 ### ACME with DNS-01
 
 DNS-01 is required for **wildcard** certificates and useful when

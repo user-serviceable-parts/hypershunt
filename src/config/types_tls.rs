@@ -113,6 +113,14 @@ pub enum TlsConfig {
         // DNS-01 only: which provider performs TXT-record updates.
         // Required when `challenge = "dns-01"`; ignored otherwise.
         dns_provider: Option<DnsProviderConfig>,
+        // ACME certificate profile to request (RFC draft "profiles"
+        // extension), e.g. a CA's short-lived profile.  None keeps
+        // the CA default so pre-existing configs are unaffected.
+        profile: Option<String>,
+        // Seconds before expiry at which renewal starts.  None means
+        // adaptive: min(30 days, a third of the cert's validity), so
+        // short-lived certs renew on a cadence that fits them.
+        renew_before_secs: Option<u64>,
     },
     /// Reference to a top-level `certificate "<name>" { ... }`.
     /// Refs cannot nest; the referent is always a concrete source.

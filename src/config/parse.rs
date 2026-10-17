@@ -144,6 +144,62 @@ pub(super) fn prop_i64(node: &KdlNode, key: &str) -> Option<i64> {
     node.get(key).and_then(|e| e.as_integer()).map(|n| n as i64)
 }
 
+// Duration property in seconds.  A bare integer is seconds; a string
+// is digits with an optional unit suffix (`s`, `m`, `h`, `d`), so
+// `renew-before="2d"` reads naturally without a calculator.  Zero and
+// negatives are rejected because every caller treats the value as a
+// positive interval.
+pub(super) fn parse_duration_prop(
+    node: &KdlNode,
+    key: &str,
+) -> anyhow::Result<Option<u64>> {
+    let Some(entry) = node.get(key) else {
+        return Ok(None);
+    };
+    if let Some(n) = entry.as_integer() {
+        if n <= 0 {
+            bail!("'{key}' must be positive");
+        }
+        return Ok(Some(n as u64));
+    }
+    let Some(text) = entry.as_string() else {
+        bail!("'{key}' must be an integer or a duration string");
+    };
+    parse_duration_str(text)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("'{key}': {e}"))
+}
+
+fn parse_duration_str(text: &str) -> anyhow::Result<u64> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (digits, unit) = text.split_at(split);
+    if digits.is_empty() {
+        bail!("{text:?} is not a duration (expected e.g. 90, \"2d\")");
+    }
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{text:?} is out of range"))?;
+    let mult = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => bail!(
+            "{text:?} has unknown unit {unit:?} (expected s, m, h, or d)"
+        ),
+    };
+    let secs = n
+        .checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("{text:?} is out of range"))?;
+    if secs == 0 {
+        bail!("{text:?} must be positive");
+    }
+    Ok(secs)
+}
+
 // Collect every value of a repeating single-arg child by name.
 //   children:  domain "a"; domain "b"  ->  ["a", "b"]
 pub(super) fn repeated_strs(node: &KdlNode, key: &str) -> Vec<String> {
