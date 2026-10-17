@@ -1,6 +1,8 @@
 // ACME certificate management (Let's Encrypt / HTTP-01 challenge).
 // AcmeManager acquires an initial certificate at startup and renews it
-// in a background task when fewer than 30 days remain before expiry.
+// in a background task once the cert enters its renewal window: the
+// configured `renew-before`, or by default the smaller of 30 days and a
+// third of the cert's validity (so short-lived profiles work unaided).
 
 /// Fixed tracing target for ACME issuance/renewal events, so operators
 /// can filter this stream regardless of internal module moves.
@@ -70,7 +72,16 @@ pub struct AcmeConfig {
     // DNS-01 provider config (only consulted when `challenge ==
     // Dns01`).  Parser already enforces presence in that case.
     pub dns_provider: Option<crate::config::DnsProviderConfig>,
+    // ACME profile to request on each order; None = CA default.
+    pub profile: Option<String>,
+    // Explicit renewal window; None = adaptive (see
+    // `renewal_window_secs`).
+    pub renew_before: Option<Duration>,
 }
+
+// Upper bound of the adaptive renewal window.  Matches the historical
+// fixed 30-day behaviour for the usual 90-day certificates.
+const MAX_RENEWAL_WINDOW_SECS: i64 = 30 * 24 * 3600;
 
 impl AcmeConfig {
     // Resolved storage directory name.
@@ -141,6 +152,7 @@ impl AcmeManager {
             challenge: config.challenge,
             dns_provider,
             alpn_store: None,
+            profile: config.profile.clone(),
         });
         Self::with_provisioner(config, challenges, tls_opts, provisioner)
     }
@@ -170,6 +182,7 @@ impl AcmeManager {
             challenge: config.challenge,
             dns_provider,
             alpn_store: Some(alpn_store.clone()),
+            profile: config.profile.clone(),
         });
         let mut mgr = Self::with_provisioner(
             config, challenges, tls_opts, provisioner,
@@ -371,7 +384,48 @@ impl AcmeManager {
         }
     }
 
-    // True if no cert exists or it expires within 30 days.
+    // Seconds before expiry at which renewal should start.
+    //
+    // Default is adaptive: a third of the cert's validity, capped at
+    // 30 days.  That reproduces the old fixed 30-day behaviour for
+    // 90-day certs while giving a 6-day short-lived cert a 2-day
+    // window instead of one that is always "already due".  An
+    // explicit `renew-before` wins unless it is at least as long as
+    // the validity itself, which would make the cert perpetually due
+    // and spin the renewal loop at its 60-second floor; that case
+    // falls back to the adaptive rule with a warning.
+    pub(crate) fn renewal_window_secs(&self, pem: &[u8]) -> i64 {
+        let validity = match (
+            cert_not_before_timestamp(pem),
+            cert_expiry_timestamp(pem),
+        ) {
+            (Ok(nb), Ok(na)) if na > nb => na - nb,
+            // Unparseable or degenerate cert: any window will do,
+            // the callers treat it as needing renewal anyway.
+            _ => return MAX_RENEWAL_WINDOW_SECS,
+        };
+        let adaptive = (validity / 3).clamp(1, MAX_RENEWAL_WINDOW_SECS);
+        match self.config.renew_before {
+            Some(d) => {
+                let explicit = d.as_secs().min(i64::MAX as u64) as i64;
+                if explicit >= validity {
+                    tracing::warn!(target: TARGET,
+                        cert = self.config.cert_name(),
+                        renew_before_secs = explicit,
+                        validity_secs = validity,
+                        "renew-before is not shorter than the \
+                         certificate's validity; using {adaptive}s"
+                    );
+                    adaptive
+                } else {
+                    explicit
+                }
+            }
+            None => adaptive,
+        }
+    }
+
+    // True if no cert exists or it is inside its renewal window.
     pub(crate) fn cert_needs_renewal(&self) -> bool {
         let cert_path = self.cert_dir().join("cert.pem");
         if !cert_path.exists() {
@@ -386,14 +440,14 @@ impl AcmeManager {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs() as i64;
-                expiry - now < 30 * 24 * 3600
+                expiry - now < self.renewal_window_secs(&pem)
             }
             Err(_) => true,
         }
     }
 
     // Duration to sleep before the next renewal attempt.
-    // Targets 30 days before cert expiry; minimum 60 seconds.
+    // Targets the start of the renewal window; minimum 60 seconds.
     pub(crate) fn time_until_renewal(&self) -> Duration {
         let cert_path = self.cert_dir().join("cert.pem");
         let Ok(pem) = std::fs::read(cert_path) else {
@@ -406,7 +460,7 @@ impl AcmeManager {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let renewal_at = expiry - 30 * 24 * 3600;
+        let renewal_at = expiry - self.renewal_window_secs(&pem);
         let secs = (renewal_at - now).max(60);
         Duration::from_secs(secs as u64)
     }
@@ -454,7 +508,7 @@ impl AcmeManager {
         let Ok(expiry_ts) = cert_expiry_timestamp(&pem) else {
             return;
         };
-        let next_renewal_ts = expiry_ts - 30 * 24 * 3600;
+        let next_renewal_ts = expiry_ts - self.renewal_window_secs(&pem);
         let entry = crate::cert::state::CertState {
             domains: self.config.domains.clone(),
             expiry_ts,
@@ -649,6 +703,10 @@ struct RealProvisioner {
     // resolver reads on every handshake.  AcmeManager publishes a
     // cert here before set_ready() and clears it after validation.
     alpn_store: Option<crate::cert::acme_alpn::AlpnChallengeStore>,
+    // Certificate profile to request; validated against the CA's
+    // advertised list before ordering so a typo fails with the real
+    // choices rather than an opaque CA error.
+    profile: Option<String>,
 }
 
 #[async_trait]
@@ -663,8 +721,29 @@ impl Provisioner for RealProvisioner {
         let identifiers: Vec<Identifier> =
             domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
 
+        let mut new_order = NewOrder::new(&identifiers);
+        if let Some(profile) = self.profile.as_deref() {
+            let advertised: Vec<&str> =
+                account.profiles().map(|p| p.name).collect();
+            if advertised.is_empty() {
+                bail!(
+                    "profile {profile:?} requested but the CA does not \
+                     advertise any certificate profiles"
+                );
+            }
+            if !advertised.contains(&profile) {
+                bail!(
+                    "profile {profile:?} is not offered by the CA; \
+                     advertised profiles: {}",
+                    advertised.join(", ")
+                );
+            }
+            tracing::info!(target: TARGET, profile,
+                "requesting ACME certificate profile");
+            new_order = new_order.profile(profile);
+        }
         let mut order = account
-            .new_order(&NewOrder::new(&identifiers))
+            .new_order(&new_order)
             .await
             .context("creating ACME order")?;
 
@@ -990,12 +1069,38 @@ mod tests {
         }
     }
 
-    // Build a self-signed cert for the given SANs expiring in `days`.
+    // Build a self-signed cert for the given SANs expiring in `days`,
+    // modelled as a 90-day cert with `days` remaining so the adaptive
+    // window stays at 30 days (the historical behaviour these tests
+    // were written against).
     fn make_cert_pem(domains: &[String], days: i64) -> (String, String) {
+        make_cert_pem_span(domains, 90, days)
+    }
+
+    // Build a self-signed cert issued now that expires in `days`: a
+    // genuinely short-lived certificate.
+    fn make_short_cert_pem(
+        domains: &[String],
+        days: i64,
+    ) -> (String, String) {
+        make_cert_pem_span(domains, days, days)
+    }
+
+    fn make_cert_pem_span(
+        domains: &[String],
+        validity_days: i64,
+        remaining_days: i64,
+    ) -> (String, String) {
         use time::{Duration, OffsetDateTime};
 
+        let now = OffsetDateTime::now_utc();
         let mut params = CertificateParams::new(domains.to_vec()).unwrap();
-        params.not_after = OffsetDateTime::now_utc() + Duration::days(days);
+        // Pin notBefore: rcgen defaults it to 1975, which would make
+        // the validity look multi-decade and hide the adaptive window.
+        params.not_before = (now + Duration::days(remaining_days)
+            - Duration::days(validity_days))
+            .min(now - Duration::minutes(1));
+        params.not_after = now + Duration::days(remaining_days);
         params.distinguished_name = DistinguishedName::new();
         let key = KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
@@ -1024,6 +1129,8 @@ mod tests {
                 cert_key_mode: 0o600,
                 challenge: crate::config::ChallengeKind::Http01,
                 dns_provider: None,
+                profile: None,
+                renew_before: None,
             },
             Arc::new(Mutex::new(HashMap::new())),
             TlsOptions::default(),
@@ -1089,6 +1196,8 @@ mod tests {
             cert_key_mode: 0o600,
             challenge: crate::config::ChallengeKind::Http01,
             dns_provider: None,
+            profile: None,
+            renew_before: None,
         };
         assert_eq!(cfg.cert_name(), "example.com");
     }
@@ -1106,6 +1215,8 @@ mod tests {
             cert_key_mode: 0o600,
             challenge: crate::config::ChallengeKind::Http01,
             dns_provider: None,
+            profile: None,
+            renew_before: None,
         };
         assert_eq!(cfg.cert_name(), "my-cert");
     }
@@ -1123,6 +1234,8 @@ mod tests {
             cert_key_mode: 0o600,
             challenge: crate::config::ChallengeKind::Http01,
             dns_provider: None,
+            profile: None,
+            renew_before: None,
         };
         assert_eq!(cfg.acme_server_url(), LetsEncrypt::Production.url());
     }
@@ -1140,6 +1253,8 @@ mod tests {
             cert_key_mode: 0o600,
             challenge: crate::config::ChallengeKind::Http01,
             dns_provider: None,
+            profile: None,
+            renew_before: None,
         };
         assert_eq!(cfg.acme_server_url(), LetsEncrypt::Staging.url());
     }
@@ -1157,6 +1272,8 @@ mod tests {
             cert_key_mode: 0o600,
             challenge: crate::config::ChallengeKind::Http01,
             dns_provider: None,
+            profile: None,
+            renew_before: None,
         };
         assert_eq!(cfg.acme_server_url(), "https://acme.example.com/dir");
     }
@@ -1235,6 +1352,98 @@ mod tests {
             diff < 120,
             "renewal sleep {s}s, expected ~{expected}s",
             s = sleep.as_secs()
+        );
+    }
+
+    // -- renewal_window_secs --------------------------------------
+
+    fn manager_with_renew_before(
+        dir: &std::path::Path,
+        renew_before: Option<Duration>,
+    ) -> AcmeManager {
+        let mut mgr = test_manager(dir, Arc::new(MockProvisioner::new()));
+        mgr.config.renew_before = renew_before;
+        mgr
+    }
+
+    fn write_cert(dir: &std::path::Path, days: i64) -> Vec<u8> {
+        let (pem, _) =
+            make_short_cert_pem(&["example.com".to_owned()], days);
+        let cert_dir = dir.join("certs").join("example.com");
+        std::fs::create_dir_all(&cert_dir).unwrap();
+        std::fs::write(cert_dir.join("cert.pem"), &pem).unwrap();
+        pem.into_bytes()
+    }
+
+    #[test]
+    fn renewal_window_defaults_to_30_days_for_long_certs() {
+        let dir = tempfile::tempdir().unwrap();
+        let pem = write_cert(dir.path(), 90);
+        let mgr = manager_with_renew_before(dir.path(), None);
+        // 90-day validity / 3 == the 30-day cap exactly.
+        assert_eq!(mgr.renewal_window_secs(&pem), 30 * 24 * 3600);
+    }
+
+    #[test]
+    fn renewal_window_is_a_third_of_short_lived_validity() {
+        let dir = tempfile::tempdir().unwrap();
+        let pem = write_cert(dir.path(), 6);
+        let mgr = manager_with_renew_before(dir.path(), None);
+        // 6 days + 1 minute of validity -> ~2 days.
+        let window = mgr.renewal_window_secs(&pem);
+        assert!((window - 2 * 24 * 3600).abs() < 60, "window {window}s");
+        assert!(!mgr.cert_needs_renewal(), "fresh short cert is not due");
+        let sleep = mgr.time_until_renewal().as_secs() as i64;
+        assert!((sleep - 4 * 24 * 3600).abs() < 120, "sleep {sleep}s");
+    }
+
+    #[test]
+    fn explicit_renew_before_overrides_adaptive_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let pem = write_cert(dir.path(), 90);
+        let two_days = Duration::from_secs(2 * 24 * 3600);
+        let mgr = manager_with_renew_before(dir.path(), Some(two_days));
+        assert_eq!(mgr.renewal_window_secs(&pem), 2 * 24 * 3600);
+        let sleep = mgr.time_until_renewal().as_secs() as i64;
+        assert!((sleep - 88 * 24 * 3600).abs() < 120, "sleep {sleep}s");
+    }
+
+    #[test]
+    fn renew_before_longer_than_validity_falls_back_to_adaptive() {
+        let dir = tempfile::tempdir().unwrap();
+        let pem = write_cert(dir.path(), 6);
+        let month = Duration::from_secs(30 * 24 * 3600);
+        let mgr = manager_with_renew_before(dir.path(), Some(month));
+        let window = mgr.renewal_window_secs(&pem);
+        assert!((window - 2 * 24 * 3600).abs() < 60, "window {window}s");
+        assert!(!mgr.cert_needs_renewal(), "must not spin on a fresh cert");
+    }
+
+    #[test]
+    fn renewal_window_for_garbage_pem_is_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = manager_with_renew_before(dir.path(), None);
+        assert_eq!(
+            mgr.renewal_window_secs(b"not a cert"),
+            30 * 24 * 3600
+        );
+    }
+
+    #[test]
+    fn publish_cert_state_uses_adaptive_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let pem = write_cert(dir.path(), 6);
+        let expiry = cert_expiry_timestamp(&pem).unwrap();
+        let state = crate::cert::state::SharedCertState::default();
+        let mgr = manager_with_renew_before(dir.path(), None)
+            .with_cert_state(state.clone());
+        mgr.publish_cert_state();
+        let v = state.read().unwrap();
+        assert_eq!(v.len(), 1);
+        let next = v[0].next_renewal_ts;
+        assert!(
+            (expiry - next - 2 * 24 * 3600).abs() < 60,
+            "next_renewal_ts {next} vs expiry {expiry}"
         );
     }
 
@@ -1353,6 +1562,8 @@ mod tests {
                 cert_key_mode: 0o640,
                 challenge: crate::config::ChallengeKind::Http01,
                 dns_provider: None,
+                profile: None,
+                renew_before: None,
             },
             Arc::new(Mutex::new(HashMap::new())),
             TlsOptions::default(),
@@ -1525,6 +1736,8 @@ mod tests {
                 cert_key_mode: 0o600,
                 challenge: crate::config::ChallengeKind::Http01,
                 dns_provider: None,
+                profile: None,
+                renew_before: None,
             },
             challenges.clone(),
             TlsOptions::default(),

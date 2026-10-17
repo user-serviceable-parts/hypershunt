@@ -9,7 +9,8 @@ pub struct CertState {
     pub domains: Vec<String>,
     // Unix timestamp of cert notAfter.
     pub expiry_ts: i64,
-    // expiry_ts - 30 * 86400: when next renewal attempt is scheduled.
+    // expiry_ts minus the renewal window: when the next renewal attempt
+    // is scheduled.
     pub next_renewal_ts: i64,
 }
 
