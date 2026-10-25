@@ -14,9 +14,10 @@ use crate::metrics::Metrics;
 use anyhow::{Context, bail};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use crate::cert::acme_account::AccountStore;
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, ChallengeType,
-    Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus, RetryPolicy,
+    AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt, NewOrder,
+    OrderStatus, RetryPolicy,
 };
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use std::collections::HashMap;
@@ -63,7 +64,7 @@ pub struct AcmeConfig {
     // How long to wait between retries after a failed acquisition.
     pub retry_interval: Duration,
     // Unix file mode for key.pem. Default 0o600; set to 0o640 to allow
-    // group-readable certs. acme_account.json is always 0o600.
+    // group-readable certs. The account key is always 0o600.
     pub cert_key_mode: u32,
     // Which ACME challenge type to perform.  HTTP-01 keeps the old
     // behaviour; DNS-01 needs a `dns_provider`; TLS-ALPN-01 only works
@@ -138,6 +139,7 @@ impl AcmeManager {
         config: AcmeConfig,
         challenges: ChallengeMap,
         tls_opts: TlsOptions,
+        accounts: Arc<AccountStore>,
     ) -> Self {
         let dns_provider = config
             .dns_provider
@@ -148,7 +150,7 @@ impl AcmeManager {
         let provisioner = Arc::new(RealProvisioner {
             server_url: config.acme_server_url().to_owned(),
             email: config.email.clone(),
-            account_path: config.state_dir.join("acme_account.json"),
+            accounts,
             challenge: config.challenge,
             dns_provider,
             alpn_store: None,
@@ -168,6 +170,7 @@ impl AcmeManager {
         challenges: ChallengeMap,
         tls_opts: TlsOptions,
         alpn_store: crate::cert::acme_alpn::AlpnChallengeStore,
+        accounts: Arc<AccountStore>,
     ) -> Self {
         let dns_provider = config
             .dns_provider
@@ -178,7 +181,7 @@ impl AcmeManager {
         let provisioner = Arc::new(RealProvisioner {
             server_url: config.acme_server_url().to_owned(),
             email: config.email.clone(),
-            account_path: config.state_dir.join("acme_account.json"),
+            accounts,
             challenge: config.challenge,
             dns_provider,
             alpn_store: Some(alpn_store.clone()),
@@ -258,7 +261,7 @@ impl AcmeManager {
     // fault, not the CA's; discovering it only after issuance would
     // waste a rate-limited request.  Probes both the cert directory's
     // parent ({state_dir}/certs, where cert.pem/key.pem land) and the
-    // state dir itself (where acme_account.json is written).
+    // state dir itself (under which acme/account-key.pem is written).
     async fn preflight_state_writable(&self) -> anyhow::Result<()> {
         let certs_dir = self.config.state_dir.join("certs");
         // create_dir_all is a no-op on an existing dir, so it can't
@@ -690,7 +693,8 @@ impl ChallengeCleanup {
 struct RealProvisioner {
     server_url: String,
     email: Option<String>,
-    account_path: PathBuf,
+    // Process-wide account key + per-directory registrations.
+    accounts: Arc<AccountStore>,
     // Which ACME challenge to perform.  Defaults to HTTP-01 for
     // backwards compatibility with every config that pre-dates the
     // multi-challenge support.
@@ -716,7 +720,10 @@ impl Provisioner for RealProvisioner {
         domains: &[String],
         challenges: &ChallengeMap,
     ) -> anyhow::Result<(String, String)> {
-        let account = self.load_or_create_account().await?;
+        let account = self
+            .accounts
+            .account(&self.server_url, self.email.as_deref())
+            .await?;
 
         let identifiers: Vec<Identifier> =
             domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
@@ -869,70 +876,6 @@ impl Provisioner for RealProvisioner {
     }
 }
 
-impl RealProvisioner {
-    async fn load_or_create_account(&self) -> anyhow::Result<Account> {
-        if self.account_path.exists() {
-            let json = tokio::fs::read_to_string(&self.account_path)
-                .await
-                .context("reading ACME account credentials")?;
-            // Fix permissions for files written by older hypershunt versions
-            // that did not set an explicit mode (best-effort on upgrade).
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                tokio::fs::set_permissions(
-                    &self.account_path,
-                    std::fs::Permissions::from_mode(0o600),
-                )
-                .await
-                .ok();
-            }
-            let creds: AccountCredentials = serde_json::from_str(&json)
-                .context("deserializing ACME credentials")?;
-            return Account::builder()
-                .context("building ACME account")?
-                .from_credentials(creds)
-                .await
-                .context("loading ACME account");
-        }
-
-        let contact = self.email.as_ref().map(|e| format!("mailto:{e}"));
-        let contact_refs: Vec<&str> =
-            contact.iter().map(String::as_str).collect();
-
-        tracing::info!(target: TARGET, "creating new ACME account");
-        let (account, creds) = Account::builder()
-            .context("building ACME account")?
-            .create(
-                &NewAccount {
-                    contact: &contact_refs,
-                    terms_of_service_agreed: true,
-                    only_return_existing: false,
-                },
-                self.server_url.clone(),
-                None,
-            )
-            .await
-            .context("creating ACME account")?;
-
-        if let Some(parent) = self.account_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .context("creating state directory")?;
-        }
-        write_private_file(
-            &self.account_path,
-            serde_json::to_string_pretty(&creds)
-                .context("serializing ACME credentials")?
-                .as_bytes(),
-            0o600,
-        )
-        .await
-        .context("saving ACME credentials")?;
-
-        Ok(account)
-    }
-}
 
 // Generate a key pair, build a CSR, finalize the order, and return
 // (cert_chain_pem, private_key_pem).

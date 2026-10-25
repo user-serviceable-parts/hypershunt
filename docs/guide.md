@@ -501,7 +501,9 @@ listener "tcp://[::]:443" {
 A few things to know:
 
 - [`state-dir`](reference.md#state-dir) is required for ACME --
-  it's where the account key and issued certificates persist.
+  it's where the account key and issued certificates persist.  There
+  is one account key per server, registered automatically with every
+  ACME directory your certificates use.
 - The port-80 listener must be reachable from Let's Encrypt for
   the HTTP-01 challenge to succeed.  Hypershunt intercepts
   `/.well-known/acme-challenge/...` automatically.
@@ -529,9 +531,12 @@ When the staging issuance succeeds, switch to production: remove
 staging certificate** from `state-dir` first.  Staging and
 production certs share the same on-disk slot, so a still-valid
 staging cert would otherwise suppress the production issuance --
-hypershunt only re-issues when the stored cert nears expiry.  For
-a custom or private ACME CA (step-ca, smallstep), point
-[`server=`](reference.md#server-acme) at its directory URL instead.
+hypershunt only re-issues when the stored cert nears expiry.  The
+account itself needs nothing: the same key is simply registered with
+the production directory on first use.  For a custom or private ACME
+CA (step-ca, smallstep), point
+[`server=`](reference.md#server-acme) at its directory URL instead;
+certificates may mix public and private CAs freely.
 
 ### Short-lived certificates
 

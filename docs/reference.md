@@ -138,10 +138,22 @@ uses [`tls "acme"`](#tls-acme) or any [`auth "jwt"`](#auth-jwt)
 backend; optional otherwise.
 
 Filesystem directory where hypershunt persists data that needs to
-survive restarts: ACME-issued certificates and account keys, the
-ES256 signing key for JWT cookies, and ACME challenge state.  The
-directory must be writable by the post-privilege-drop user.  Hypershunt
-creates subdirectories under it (`acme/`, `jwt/`) as needed.
+survive restarts.  The directory must be writable by the
+post-privilege-drop user; hypershunt creates the subdirectories as
+needed:
+
+| Path | Contents |
+|---|---|
+| `acme/account-key.pem` | The ACME account key (mode 0600).  One per server; it is registered with each ACME directory the configuration uses. |
+| `certs/<name>/` | Issued certificate and key per [`tls "acme"`](#tls-acme) slot (see [`name`](#name-acme)). |
+| `ocsp/` | Cached OCSP staples. |
+| `jwt/ec-key.pem` | ES256 signing key for [`auth "jwt"`](#auth-jwt) cookies. |
+
+Releases before the `acme/` layout stored the account as
+`acme_account.json` at the top level.  On first start the key is
+copied out of that file into `acme/account-key.pem`; the old file is
+left in place and can be removed once you no longer need to roll
+back.
 
 ```kdl
 server state-dir="/var/lib/hypershunt"
@@ -1845,14 +1857,18 @@ Domain name to include on the issued certificate.  Wildcards
 
 **Property** on [`tls "acme"`](#tls-acme).  Optional string.
 
-Email address registered with the ACME server for renewal
-notifications and rate-limit identification.
+Email address registered as the account contact at this
+certificate's ACME directory, for expiry notices and rate-limit
+identification.  All certificates share one account key, so when
+several certificates use the same directory the first to issue sets
+the contact and a differing `email=` on another is logged and
+ignored.  A changed `email=` is sent to the CA on the next restart.
 
 ##### name (acme)
 
 **Property** on [`tls "acme"`](#tls-acme).  Optional string.
 
-Directory name under `{state-dir}/acme/` where the issued
+Directory name under `{state-dir}/certs/` where the issued
 certificate is stored.  Defaults to the first listed domain.  Set
 explicitly to share an on-disk slot between configurations.
 
@@ -1874,7 +1890,10 @@ When switching from staging to production, delete the cached
 staging certificate under [`state-dir`](#state-dir) first: the two
 share the same on-disk slot and hypershunt only re-issues when the
 stored cert nears expiry, so a valid staging cert would otherwise
-suppress the production issuance.
+suppress the production issuance.  The account needs no attention:
+the same account key is registered with each directory on first
+use, so flipping `staging` never leaves issuance pointed at the
+wrong CA.
 
 **Default:** `#false`.
 
@@ -1883,7 +1902,10 @@ suppress the production issuance.
 **Property** on [`tls "acme"`](#tls-acme).  Optional string.
 
 ACME directory URL to use in place of Let's Encrypt.  Useful with
-private CAs that speak ACME (e.g. step-ca, smallstep).
+private CAs that speak ACME (e.g. step-ca, smallstep).  Different
+certificates may name different directories; the single account key
+under [`state-dir`](#state-dir) is registered with each one the
+first time a certificate there is issued.
 
 **Default:** `https://acme-v02.api.letsencrypt.org/directory`.
 

@@ -77,6 +77,7 @@ pub async fn build_tls_listener_future(
         deps.state_dir.as_ref(),
         &deps.challenges,
         &deps.cert_state,
+        &deps.accounts,
         &deps.cert_registry.load(),
         deps.cert_key_mode,
         cfg.alpn.as_deref(),
@@ -272,6 +273,7 @@ pub async fn build_quic_listener_future(
         deps.state_dir.as_ref(),
         &deps.challenges,
         &deps.cert_state,
+        &deps.accounts,
         &deps.cert_registry.load(),
         deps.cert_key_mode,
         cfg.alpn.as_deref(),
@@ -358,6 +360,7 @@ pub async fn build_stream_listener_future(
                 deps.state_dir.as_ref(),
                 &deps.challenges,
                 &deps.cert_state,
+                &deps.accounts,
                 &deps.cert_registry.load(),
                 deps.cert_key_mode,
                 cfg.alpn.as_deref(),
@@ -458,6 +461,9 @@ pub struct ListenerSpawnDeps {
     pub state_dir: Option<std::path::PathBuf>,
     pub challenges: crate::cert::acme::ChallengeMap,
     pub cert_state: crate::cert::state::SharedCertState,
+    /// ACME account key and its per-directory registrations; one
+    /// per process so every certificate shares the same account.
+    pub accounts: Arc<crate::cert::acme_account::AccountStore>,
     /// Named certificate registry, swappable across reloads so a
     /// SIGHUP can add or remove `certificate "..."` definitions
     /// without restart.  Existing TLS listeners hold their own
@@ -579,6 +585,9 @@ mod tests {
             state_dir: None,
             challenges: Default::default(),
             cert_state,
+            accounts: Arc::new(crate::cert::acme_account::AccountStore::new(
+                std::path::Path::new("/nonexistent"),
+            )),
             cert_registry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             cert_source_fingerprints: Arc::new(ArcSwap::from_pointee(
                 HashMap::new(),
