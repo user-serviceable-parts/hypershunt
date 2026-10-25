@@ -1822,7 +1822,9 @@ least one domain is required; multiple domains share the same
 issued certificate as Subject Alternative Names.  Set
 [`challenge`](#challenge) to `"dns-01"` to use a
 [`dns-provider`](#dns-provider) instead of the default HTTP-01.
-ACME requires [`state-dir`](#state-dir).
+Set [`profile`](#profile) to request a CA-advertised certificate
+profile such as a short-lived one; [`renew-before`](#renew-before)
+tunes when renewal starts.  ACME requires [`state-dir`](#state-dir).
 
 ```kdl
 tls "acme" email="ops@example.com" {
@@ -1902,6 +1904,53 @@ Encrypt's rate limit is 5 failed validations per account per
 hostname per hour; the default keeps comfortably within it.
 
 **Default:** `3600` (one hour).
+
+##### profile
+
+**Property** on [`tls "acme"`](#tls-acme).  Optional string.
+
+Name of an ACME certificate profile to request, as advertised in
+the CA's directory `meta.profiles` (for Let's Encrypt:
+`"classic"` or `"shortlived"`).  Short-lived certificates narrow
+the window in which a compromised key is usable and remove the
+dependence on revocation.  Startup fails with the list of
+advertised names when the profile is unknown, and with a clear
+error when the CA advertises no profiles at all.  Renewal cadence
+follows the issued certificate automatically; see
+[`renew-before`](#renew-before).
+
+**Default:** unset (the CA's default profile).
+
+```kdl
+tls "acme" email="ops@example.com" profile="shortlived" {
+    domain "example.com"
+}
+```
+
+##### renew-before
+
+**Property** on [`tls "acme"`](#tls-acme).  Optional integer or
+string.
+
+How long before expiry renewal begins.  An integer is seconds; a
+string is digits with a unit suffix: `s`, `m`, `h`, or `d`
+(`"2d"`, `"12h"`).  Must be positive.
+
+When unset the window adapts to the certificate: one third of its
+validity, capped at 30 days.  A 90-day certificate therefore
+renews 30 days out (the historical behaviour) and a 6-day
+short-lived one renews 2 days out.  A value equal to or longer
+than the certificate's validity would make it permanently due,
+so hypershunt logs a warning and uses the adaptive window
+instead.
+
+**Default:** adaptive (`min(30d, validity / 3)`).
+
+```kdl
+tls "acme" profile="shortlived" renew-before="36h" {
+    domain "example.com"
+}
+```
 
 ##### challenge
 

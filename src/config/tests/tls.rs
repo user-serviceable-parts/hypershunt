@@ -3230,3 +3230,95 @@ fn server_cache_max_size_parses() {
         Some(1048576)
     );
 }
+
+// -- ACME profile + renew-before ---------------------------------
+
+fn acme_cfg(props: &str) -> anyhow::Result<Config> {
+    Config::parse(&format!(
+        r#"
+        server state-dir="/tmp/hypershunt-test"
+        listener "tcp://[::]:443" {{
+            tls "acme" {props} {{ domain "example.com" }}
+        }}
+        vhost "h" {{ location "/" {{ static root="." }} }}
+        "#
+    ))
+}
+
+fn acme_fields(cfg: &Config) -> (Option<String>, Option<u64>) {
+    match &cfg.listeners[0].tls.as_ref().unwrap().cert {
+        TlsConfig::Acme {
+            profile,
+            renew_before_secs,
+            ..
+        } => (profile.clone(), *renew_before_secs),
+        other => panic!("expected Acme, got {other:?}"),
+    }
+}
+
+#[test]
+fn acme_profile_and_renew_before_default_to_none() {
+    let cfg = acme_cfg("").unwrap();
+    assert_eq!(acme_fields(&cfg), (None, None));
+}
+
+#[test]
+fn acme_profile_parses() {
+    let cfg = acme_cfg(r#"profile="shortlived""#).unwrap();
+    assert_eq!(acme_fields(&cfg).0.as_deref(), Some("shortlived"));
+}
+
+#[test]
+fn acme_profile_rejects_empty() {
+    let err = acme_cfg("profile=\"\"").unwrap_err().to_string();
+    assert!(err.contains("'profile' must not be empty"), "got: {err}");
+}
+
+#[test]
+fn acme_renew_before_accepts_seconds_and_units() {
+    for (prop, secs) in [
+        ("renew-before=172800", 172_800),
+        (r#"renew-before="172800""#, 172_800),
+        (r#"renew-before="45s""#, 45),
+        (r#"renew-before="90m""#, 5_400),
+        (r#"renew-before="12h""#, 43_200),
+        (r#"renew-before="2d""#, 172_800),
+    ] {
+        let cfg = acme_cfg(prop).unwrap_or_else(|e| panic!("{prop}: {e}"));
+        assert_eq!(acme_fields(&cfg).1, Some(secs), "{prop}");
+    }
+}
+
+#[test]
+fn acme_renew_before_rejects_bad_values() {
+    for (prop, needle) in [
+        ("renew-before=0", "must be positive"),
+        ("renew-before=-5", "must be positive"),
+        (r#"renew-before="0d""#, "must be positive"),
+        (r#"renew-before="2w""#, "unknown unit"),
+        (r#"renew-before="abc""#, "not a duration"),
+        (r#"renew-before="""#, "not a duration"),
+        ("renew-before=#true", "integer or a duration string"),
+    ] {
+        let err = acme_cfg(prop).unwrap_err().to_string();
+        assert!(
+            err.contains("renew-before") && err.contains(needle),
+            "{prop}: got: {err}"
+        );
+    }
+}
+
+#[test]
+fn self_signed_rejects_acme_only_properties() {
+    for prop in [r#"profile="x""#, r#"renew-before="2d""#] {
+        let err = Config::parse(&format!(
+            r#"
+            listener "tcp://[::]:443" {{ tls "self-signed" {prop} }}
+            vhost "h" {{ location "/" {{ static root="." }} }}
+            "#
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("self-signed"), "{prop}: got: {err}");
+    }
+}

@@ -452,6 +452,8 @@ The properties valid on a `tls` node depend on the kind.
   `staging=`[`<boolean>`](#boolean)?
   `server=`[`<string>`](#string)?
   `retry-interval=`[`<integer>`](#integer)?
+  `profile=`[`<string>`](#string)?
+  `renew-before=`( [`<integer>`](#integer) | [`<string>`](#string) )?
   `challenge=`( `"http-01"` | `"dns-01"` | `"tls-alpn-01"` )?
 - `"self-signed"`: none
 - `"ref"`: `name=`[`<string>`](#string) (names a top-level
