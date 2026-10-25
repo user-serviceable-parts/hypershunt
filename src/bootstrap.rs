@@ -93,6 +93,7 @@ pub(crate) async fn build_cert_source(
     state_dir: Option<&PathBuf>,
     challenges: &ChallengeMap,
     cert_state: &cert::state::SharedCertState,
+    accounts: &Arc<cert::acme_account::AccountStore>,
     registry: &CertRegistry,
     cert_key_mode: u32,
     alpn: Option<&[String]>,
@@ -116,6 +117,7 @@ pub(crate) async fn build_cert_source(
         state_dir,
         challenges,
         cert_state,
+        accounts,
         cert_key_mode,
         alpn,
         metrics,
@@ -134,6 +136,7 @@ async fn build_cert_source_from_source(
     state_dir: Option<&PathBuf>,
     challenges: &ChallengeMap,
     cert_state: &cert::state::SharedCertState,
+    accounts: &Arc<cert::acme_account::AccountStore>,
     cert_key_mode: u32,
     alpn: Option<&[String]>,
     metrics: &Arc<Metrics>,
@@ -187,11 +190,13 @@ async fn build_cert_source_from_source(
                         challenges.clone(),
                         resolved,
                         s,
+                        accounts.clone(),
                     ),
                     None => AcmeManager::new(
                         acme_cfg,
                         challenges.clone(),
                         resolved,
+                        accounts.clone(),
                     ),
                 }
                 .with_cert_state(cert_state.clone())
@@ -319,6 +324,7 @@ pub(crate) async fn build_cert_registry(
     state_dir: Option<&PathBuf>,
     challenges: &ChallengeMap,
     cert_state: &cert::state::SharedCertState,
+    accounts: &Arc<cert::acme_account::AccountStore>,
     cert_key_mode: u32,
     // Reuse cache: for any name found in `existing` whose
     // Debug-fingerprint in `existing_sources` matches the new
@@ -363,6 +369,7 @@ pub(crate) async fn build_cert_registry(
             state_dir,
             challenges,
             cert_state,
+            accounts,
             cert_key_mode,
             None,
             metrics,

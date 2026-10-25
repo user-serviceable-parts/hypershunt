@@ -11,6 +11,7 @@
 // - `ocsp`  — OCSP staple refresh task.
 
 pub mod acme;
+pub mod acme_account;
 pub mod acme_alpn;
 pub mod mtls;
 pub mod ocsp;

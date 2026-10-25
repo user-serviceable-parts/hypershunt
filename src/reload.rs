@@ -196,6 +196,7 @@ pub async fn reload(reload_state: &ReloadState) -> ReloadOutcome {
         reload_state.spawn_deps.state_dir.as_ref(),
         &reload_state.spawn_deps.challenges,
         &reload_state.spawn_deps.cert_state,
+        &reload_state.spawn_deps.accounts,
         reload_state.spawn_deps.cert_key_mode,
         &old_registry_snapshot,
         &old_fingerprints,
@@ -786,6 +787,9 @@ mod tests {
             state_dir: None,
             challenges: Default::default(),
             cert_state: cert_state.clone(),
+            accounts: Arc::new(crate::cert::acme_account::AccountStore::new(
+                std::path::Path::new("/nonexistent"),
+            )),
             cert_registry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             cert_source_fingerprints: Arc::new(
                 ArcSwap::from_pointee(HashMap::new()),

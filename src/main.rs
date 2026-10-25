@@ -494,12 +494,20 @@ async fn main() -> anyhow::Result<()> {
     // races on its own ACME directory" into "one shared renewal loop".
     let cert_key_mode = config.server.cert_key_mode.unwrap_or(0o600);
 
+    // One ACME account for the whole process.  The key lives under
+    // state-dir; without a state-dir no ACME block can exist
+    // (validated), so the placeholder path is never touched.
+    let acme_accounts = Arc::new(cert::acme_account::AccountStore::new(
+        state_dir.as_deref().unwrap_or(std::path::Path::new("/nonexistent")),
+    ));
+
     let (cert_registry, initial_cert_handles) = build_cert_registry(
         &config.certificates,
         &tls_defaults,
         state_dir.as_ref(),
         &challenges,
         &cert_state,
+        &acme_accounts,
         cert_key_mode,
         &HashMap::new(),
         &HashMap::new(),
@@ -563,6 +571,7 @@ async fn main() -> anyhow::Result<()> {
         state_dir: state_dir.clone(),
         challenges: challenges.clone(),
         cert_state: cert_state.clone(),
+        accounts: acme_accounts.clone(),
         cert_registry: cert_registry_swap.clone(),
         cert_source_fingerprints: cert_source_fingerprints_swap.clone(),
         cert_key_mode,
