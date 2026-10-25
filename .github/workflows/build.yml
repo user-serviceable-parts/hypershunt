@@ -46,9 +46,23 @@ jobs:
       # version to the crate version and (2) regenerated docs/manual.md.
       # A diff here means docs/hypershunt.1 or docs/manual.md was left
       # stale (e.g. a version bump or man-page edit wasn't rebuilt+committed).
+      #
+      # The mirror is compared on its text content only.  pandoc's
+      # man->Markdown rendering shifts between releases (emphasis marker
+      # placement, blockquote indentation), and the runner's pandoc moves
+      # with ubuntu-latest, so a byte-exact diff fails spuriously whenever
+      # the two drift apart.  Stripping markup and collapsing whitespace
+      # still catches the real failure: the man page's words changed and
+      # the committed mirror was not regenerated.
       run: |
-        git diff --exit-code docs/hypershunt.1 docs/manual.md \
-          || { echo "::error::docs/hypershunt.1 or docs/manual.md is stale — run 'cargo build' and commit the result"; exit 1; }
+        git diff --exit-code docs/hypershunt.1 \
+          || { echo "::error::docs/hypershunt.1 is stale — run 'cargo build' and commit the result"; exit 1; }
+        normalize() {
+          sed -E 's/[*_`\\>]//g; s/[[:space:]]+/ /g; s/^ //; s/ $//' | grep -v '^$'
+        }
+        diff <(git show HEAD:docs/manual.md | normalize) \
+             <(normalize < docs/manual.md) \
+          || { echo "::error::docs/manual.md is stale — run 'cargo build' and commit the result"; exit 1; }
 
     - name: Run tests
       run: cargo test --verbose
