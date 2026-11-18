@@ -3,8 +3,9 @@ name: Build Project
 on:
   push:
     branches: [ "main" ]
+  # Every pull request, whatever its base: a PR stacked on another
+  # PR's branch needs checking as much as one aimed at main.
   pull_request:
-    branches: [ "main" ]
 
 env:
   CARGO_TERM_COLOR: always

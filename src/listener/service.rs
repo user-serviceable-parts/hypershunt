@@ -1141,8 +1141,10 @@ impl HypershuntService {
 
                         // Rate-limit gate: evaluate every configured
                         // rule in declaration order; first denial
-                        // short-circuits with 429.  Identity is
-                        // already resolved above so `key user` works.
+                        // short-circuits with 429.  `key user` sees
+                        // a username only if the policy or a template
+                        // made the code above resolve the identity;
+                        // otherwise the request counts as anonymous.
                         let mut rl_denied: Option<(String, u32)> = None;
                         for rule in &route.rate_limits {
                             match rule.check(&req_ctx, req.headers()) {
