@@ -3,14 +3,25 @@ name: Build Project
 on:
   push:
     branches: [ "main" ]
+  # Every pull request, whatever its base: a PR stacked on another
+  # PR's branch needs checking as much as one aimed at main.
+  # `edited` is included because changing a PR's base branch arrives
+  # as that event, and the result of merging into a different base
+  # has not been tested; the `build` job filters out the other edits
+  # (title, description) that share the event.
   pull_request:
-    branches: [ "main" ]
+    types: [ opened, synchronize, reopened, edited ]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
+    # Of the `edited` events, run only for a base-branch change.
+    # `integration-test` needs this job, so skipping here skips both.
+    if: >-
+      github.event.action != 'edited' ||
+      github.event.changes.base != null
     runs-on: ubuntu-latest
 
     steps:
