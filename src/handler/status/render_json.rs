@@ -255,6 +255,13 @@ pub(super) fn render_json(
         "triggers":    s.rate_limit.triggers,
         "active_keys": s.rate_limit.active_keys,
     });
+    let concurrency_json = serde_json::json!({
+        "rejected":  s.concurrency.rejected,
+        "queued":    s.concurrency.queued,
+        "dry_run":   s.concurrency.dry_run,
+        "in_flight": s.concurrency.in_flight,
+        "waiting":   s.concurrency.waiting,
+    });
     let cache_json = serde_json::json!({
         "hits":          s.cache.hits,
         "misses":        s.cache.misses,
@@ -380,6 +387,7 @@ pub(super) fn render_json(
         "proxy_lb":       proxy_lb_json,
         "proxy_upstream": proxy_upstream_json,
         "rate_limit":     rate_limit_json,
+        "concurrency_limit": concurrency_json,
         "cache":          cache_json,
         "oidc":           oidc_json,
         "http_conns":     http_conns_json,

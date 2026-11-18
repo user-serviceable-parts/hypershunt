@@ -700,6 +700,15 @@ pub(crate) fn render_prometheus(
             s.cache.revalidations),
         ("rate_limit_triggers_total", "Requests rejected with 429.",
             s.rate_limit.triggers),
+        ("concurrency_limit_rejected_total",
+            "Requests rejected by a concurrency limit.",
+            s.concurrency.rejected),
+        ("concurrency_limit_queued_total",
+            "Requests that waited for a concurrency slot.",
+            s.concurrency.queued),
+        ("concurrency_limit_dry_run_total",
+            "Would-be rejections admitted by a dry-run limit.",
+            s.concurrency.dry_run),
         ("compress_responses_total", "Responses compressed.",
             s.compression.responses),
         ("compress_skipped_total", "Responses not compressed.",
@@ -715,6 +724,12 @@ pub(crate) fn render_prometheus(
         ("rate_limit_active_keys",
             "Live rate-limit buckets (refreshed every 60s).",
             s.rate_limit.active_keys),
+        ("concurrency_limit_in_flight",
+            "Concurrency slots held right now.",
+            s.concurrency.in_flight.max(0) as u64),
+        ("concurrency_limit_waiting",
+            "Requests queued for a concurrency slot right now.",
+            s.concurrency.waiting.max(0) as u64),
     ] {
         let full = format!("{p}_{name}");
         write_meta(&mut o, &full, help, "gauge");
@@ -1026,6 +1041,28 @@ mod tests {
 {listener=\"tcp://0.0.0.0:80\"} 1"
         ));
         assert!(body.contains("hypershunt_build_info{version="));
+    }
+
+    #[test]
+    fn render_includes_concurrency_limit_series() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let m = Metrics::new();
+        m.concurrency_rejected.fetch_add(3, Relaxed);
+        m.concurrency_queued.fetch_add(2, Relaxed);
+        m.concurrency_dry_run.fetch_add(1, Relaxed);
+        m.concurrency_in_flight.fetch_add(5, Relaxed);
+        m.concurrency_waiting.fetch_add(4, Relaxed);
+        let body = render_prometheus(&m, None);
+        lines_parse(&body);
+        for line in [
+            "hypershunt_concurrency_limit_rejected_total 3",
+            "hypershunt_concurrency_limit_queued_total 2",
+            "hypershunt_concurrency_limit_dry_run_total 1",
+            "hypershunt_concurrency_limit_in_flight 5",
+            "hypershunt_concurrency_limit_waiting 4",
+        ] {
+            assert!(body.contains(line), "missing {line}");
+        }
     }
 
     #[test]

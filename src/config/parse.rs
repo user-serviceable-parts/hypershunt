@@ -288,6 +288,28 @@ pub(super) fn parse_server(
         }
     }
 
+    // Collect named concurrency pools defined in the server node.
+    let mut concurrency_limits = HashMap::new();
+    for child in node.children().map(|d| d.nodes()).unwrap_or_default() {
+        if child.name().value() != "concurrency-limit" {
+            continue;
+        }
+        let child_line = node_line(src, child);
+        let pool = arg_str(child, 0).ok_or_else(|| {
+            anyhow!(
+                "{name}:{child_line}: 'concurrency-limit' in 'server' \
+                 requires a name argument"
+            )
+        })?;
+        let cfg = parse_concurrency_limit(child, src, name, pool.clone())?;
+        if concurrency_limits.insert(pool.clone(), cfg).is_some() {
+            bail!(
+                "{name}:{child_line}: duplicate concurrency-limit \
+                 name '{pool}'"
+            );
+        }
+    }
+
     // Collect `variable` definitions in declaration order; semantic
     // validation happens in vars::VarTable::build via validate().
     let mut variables = Vec::new();
@@ -383,6 +405,7 @@ pub(super) fn parse_server(
         geoip,
         health,
         policies,
+        concurrency_limits,
         variables,
         cache,
         error_pages,
@@ -1137,6 +1160,15 @@ fn parse_location(
             idx,
         )?);
     }
+    let mut concurrency_limits = Vec::new();
+    for (idx, n) in children
+        .iter()
+        .filter(|n| n.name().value() == "concurrency-limit")
+        .enumerate()
+    {
+        concurrency_limits
+            .push(parse_concurrency_limit_ref(n, src, name, &path, idx)?);
+    }
     let max_request_body =
         prop_i64(node, "max-request-body").map(|n| n as u64);
     let matcher = children
@@ -1166,6 +1198,7 @@ fn parse_location(
         request_headers,
         response_headers,
         rate_limits,
+        concurrency_limits,
         max_request_body,
         matcher,
         rewrite,
@@ -1337,7 +1370,7 @@ fn parse_rate_limit(
              `key \"user\"`, or `key \"header\" \"<Name>\"` child"
         )
     })?;
-    let key = parse_rate_limit_key(key_node, src, name)?;
+    let key = parse_rate_limit_key(key_node, src, name, "rate-limit")?;
     let rule_name = prop_str(node, "name").unwrap_or_else(
         || format!("{}-rl-{}", loc_path.trim_matches('/'), idx),
     );
@@ -1349,15 +1382,131 @@ fn parse_rate_limit(
     })
 }
 
+const CONCURRENCY_LIMIT_PROPS: [&str; 6] =
+    ["max", "queue", "queue-timeout", "status", "dry-run", "name"];
+
+/// A `concurrency-limit` node inside a location.  A positional
+/// argument makes it a reference to a `server` pool; without one it
+/// defines a pool of its own.
+fn parse_concurrency_limit_ref(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+    loc_path: &str,
+    idx: usize,
+) -> anyhow::Result<crate::config::ConcurrencyLimitRef> {
+    use crate::config::ConcurrencyLimitRef;
+    let line = node_line(src, node);
+    let Some(pool) = arg_str(node, 0) else {
+        let default_name = prop_str(node, "name").unwrap_or_else(|| {
+            format!("{}-cl-{}", loc_path.trim_matches('/'), idx)
+        });
+        return parse_concurrency_limit(node, src, name, default_name)
+            .map(ConcurrencyLimitRef::Inline);
+    };
+    // The pool's settings live with its definition; letting a
+    // reference restate them would invite two locations disagreeing
+    // about one shared pool.
+    if node.entries().len() > 1 || node.children().is_some() {
+        bail!(
+            "{name}:{line}: concurrency-limit \"{pool}\" refers to a \
+             pool defined in 'server' and takes no properties or \
+             children"
+        );
+    }
+    Ok(ConcurrencyLimitRef::Named { name: pool, line })
+}
+
+/// Parse a pool definition: inline in a location, or named in
+/// `server` (where `pool_name` is the node's positional argument).
+fn parse_concurrency_limit(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+    pool_name: String,
+) -> anyhow::Result<crate::config::ConcurrencyLimitConfig> {
+    let line = node_line(src, node);
+    for prop in node.entries().iter().filter_map(|e| e.name()) {
+        let prop = prop.value();
+        if !CONCURRENCY_LIMIT_PROPS.contains(&prop) {
+            bail!(
+                "{name}:{line}: concurrency-limit unknown property \
+                 '{prop}'{}",
+                did_you_mean(prop, &CONCURRENCY_LIMIT_PROPS)
+            );
+        }
+    }
+    let int_in = |key: &str, lo: i64, hi: i64| -> anyhow::Result<_> {
+        match prop_i64(node, key) {
+            Some(n) if (lo..=hi).contains(&n) => Ok(Some(n)),
+            Some(n) => bail!(
+                "{name}:{line}: concurrency-limit `{key}` must be \
+                 {lo}..={hi} (got {n})"
+            ),
+            None => Ok(None),
+        }
+    };
+    let max = int_in("max", 1, u32::MAX.into())?.ok_or_else(|| {
+        anyhow!("{name}:{line}: concurrency-limit requires max=<integer>")
+    })? as u32;
+    let queue = int_in("queue", 0, u32::MAX.into())?.unwrap_or(0) as u32;
+    let queue_timeout_secs = parse_duration_prop(node, "queue-timeout")
+        .map_err(|e| anyhow!("{name}:{line}: concurrency-limit {e}"))?;
+    // A queue with no deadline would park requests for as long as the
+    // pool stays busy, so the wait bound is never left implicit.
+    match (queue > 0, queue_timeout_secs.is_some()) {
+        (true, false) => bail!(
+            "{name}:{line}: concurrency-limit `queue` requires \
+             `queue-timeout`"
+        ),
+        (false, true) => bail!(
+            "{name}:{line}: concurrency-limit `queue-timeout` requires \
+             `queue` > 0"
+        ),
+        _ => {}
+    }
+    let status = int_in("status", 400, 599)?.unwrap_or(503) as u16;
+    let mut key = None;
+    for child in node.children().map(|d| d.nodes()).unwrap_or_default() {
+        let child_name = child.name().value();
+        if child_name != "key" {
+            bail!(
+                "{name}:{}: unknown node '{child_name}' in \
+                 concurrency-limit{}",
+                node_line(src, child),
+                did_you_mean(child_name, &["key"])
+            );
+        }
+        key = Some(parse_rate_limit_key(
+            child,
+            src,
+            name,
+            "concurrency-limit",
+        )?);
+    }
+    Ok(crate::config::ConcurrencyLimitConfig {
+        name: pool_name,
+        max,
+        queue,
+        queue_timeout_secs,
+        status,
+        dry_run: prop_bool(node, "dry-run").unwrap_or(false),
+        key,
+    })
+}
+
+// `what` is the owning directive's name, for error text: the same
+// key forms serve `rate-limit` and `concurrency-limit`.
 fn parse_rate_limit_key(
     node: &KdlNode,
     src: &str,
     name: &str,
+    what: &str,
 ) -> anyhow::Result<crate::config::RateLimitKeyConfig> {
     let line = node_line(src, node);
     let kind = arg_str(node, 0).ok_or_else(|| {
         anyhow!(
-            "{name}:{line}: rate-limit `key` requires a form \
+            "{name}:{line}: {what} `key` requires a form \
              (client-ip | user | header \"<Name>\")"
         )
     })?;
@@ -1367,7 +1516,7 @@ fn parse_rate_limit_key(
         "header" => {
             let header = arg_str(node, 1).ok_or_else(|| {
                 anyhow!(
-                    "{name}:{line}: rate-limit `key \"header\"` \
+                    "{name}:{line}: {what} `key \"header\"` \
                      requires a header name (e.g. `key \"header\" \
                      \"X-API-Key\"`)"
                 )
@@ -1377,7 +1526,7 @@ fn parse_rate_limit_key(
             hyper::header::HeaderName::from_bytes(header.as_bytes())
                 .map_err(|e| {
                     anyhow!(
-                        "{name}:{line}: rate-limit invalid header \
+                        "{name}:{line}: {what} invalid header \
                          name {header:?}: {e}"
                     )
                 })?;
@@ -1386,7 +1535,7 @@ fn parse_rate_limit_key(
             ))
         }
         other => bail!(
-            "{name}:{line}: rate-limit unknown key form {other:?}; \
+            "{name}:{line}: {what} unknown key form {other:?}; \
              expected client-ip, user, or header"
         ),
     }

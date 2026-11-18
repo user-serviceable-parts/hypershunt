@@ -167,6 +167,7 @@ Examples:
 - `"health"` ( `enabled=`[`<boolean>`](#boolean) )? ( `{`
   [`<health-child>`](#health-child)* `}` )?
 - [`<policy-def>`](#policy-def)
+- [`<concurrency-limit-def>`](#concurrency-limit-def)
 - [`<variable-def>`](#variable-def)
 - [`<error-page-def>`](#error-page-def)
 - [`<access-log-block>`](#access-log-block)
@@ -550,6 +551,7 @@ listed in [`<l4-proxy-opt>`](#l4-proxy-opt).
 - [`<request-headers-block>`](#request-headers-block)
 - [`<response-headers-block>`](#response-headers-block)
 - [`<rate-limit-block>`](#rate-limit-block)
+- [`<concurrency-limit-block>`](#concurrency-limit-block)
 - [`<match-block>`](#match-block)
 - [`<rewrite-directive>`](#rewrite-directive)
 - [`<variable-def>`](#variable-def)
@@ -567,6 +569,31 @@ listed in [`<l4-proxy-opt>`](#l4-proxy-opt).
 - `"key"` `"client-ip"`
 - `"key"` `"user"`
 - `"key"` `"header"` [`<string>`](#string)
+
+### `concurrency-limit-block`
+
+- `"concurrency-limit"`
+  [`<concurrency-limit-props>`](#concurrency-limit-props)
+  ( `name=`[`<string>`](#string) )?
+  ( `{` [`<rate-limit-key>`](#rate-limit-key) `}` )?
+- `"concurrency-limit"` [`<string>`](#string)
+
+The second form refers to a pool defined by a
+[`<concurrency-limit-def>`](#concurrency-limit-def).
+
+### `concurrency-limit-def`
+
+`"concurrency-limit"` [`<string>`](#string)
+[`<concurrency-limit-props>`](#concurrency-limit-props)
+( `{` [`<rate-limit-key>`](#rate-limit-key) `}` )?
+
+### `concurrency-limit-props`
+
+`max=`[`<integer>`](#integer)
+( `queue=`[`<integer>`](#integer)
+`queue-timeout=`( [`<integer>`](#integer) | [`<string>`](#string) ) )?
+( `status=`[`<integer>`](#integer) )?
+( `dry-run=`[`<boolean>`](#boolean) )?
 
 ### `rewrite-directive`
 

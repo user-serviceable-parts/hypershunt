@@ -141,6 +141,9 @@ pub struct ServerConfig {
     pub health: HealthConfig,
     // Named policy blocks available to all vhosts/locations.
     pub policies: HashMap<String, Vec<PolicyRuleDef>>,
+    // Named concurrency pools; a location draws on one by name, and
+    // every location naming the same pool shares its slots.
+    pub concurrency_limits: HashMap<String, ConcurrencyLimitConfig>,
     // Server-level `variable` definitions, in declaration order.
     // Compiled into a `vars::VarTable` at router build.
     pub variables: Vec<VariableDef>,
@@ -198,6 +201,7 @@ impl Default for ServerConfig {
             geoip: None,
             health: Default::default(),
             policies: HashMap::new(),
+            concurrency_limits: HashMap::new(),
             variables: Vec::new(),
             cache: None,
             error_pages: Vec::new(),
@@ -806,6 +810,9 @@ pub struct LocationConfig {
     // after auth/policy and before the handler runs.  Empty Vec
     // means no limiting.
     pub rate_limits: Vec<RateLimitConfig>,
+    // Concurrency pools this location's requests must hold a slot
+    // in, taken in declaration order after the rate-limit rules.
+    pub concurrency_limits: Vec<ConcurrencyLimitRef>,
     // Override for the listener-wide `max-request-body` cap.  Bytes;
     // `None` keeps the listener cap.  Enforced after routing
     // resolves the location; the listener-wide cap still applies as
@@ -933,6 +940,40 @@ pub enum RateLimitKeyConfig {
     /// Lowercased; validated as a `hyper::header::HeaderName` at
     /// parse time.
     Header(String),
+}
+
+/// One configured concurrency pool.  Converted to a
+/// `concurrency::ConcurrencyLimit` (with its slot state) in router.rs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConcurrencyLimitConfig {
+    /// Display name: the pool name for a `server` pool, otherwise
+    /// `name=` or `<path>-cl-<idx>`.
+    pub name: String,
+    /// Requests allowed in flight at once (per key).
+    pub max: u32,
+    /// Requests allowed to wait for a slot; `0` rejects at once.
+    pub queue: u32,
+    /// Longest wait for a slot, in seconds.  `Some` exactly when
+    /// `queue > 0`.
+    pub queue_timeout_secs: Option<u64>,
+    /// Status sent to a rejected request.
+    pub status: u16,
+    /// Log and count would-be rejections without rejecting.
+    pub dry_run: bool,
+    /// `None` is one pool for every request.
+    pub key: Option<RateLimitKeyConfig>,
+}
+
+/// A `concurrency-limit` node inside a location: either its own pool
+/// or a reference to a pool declared in `server`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcurrencyLimitRef {
+    Inline(ConcurrencyLimitConfig),
+    Named {
+        name: String,
+        // 1-based source line, for the unknown-pool error.
+        line: usize,
+    },
 }
 
 /// Body source for the `respond` handler.
@@ -1245,6 +1286,28 @@ impl Config {
         };
         let var_table = crate::vars::VarTable::build(&self.server.variables)
             .map_err(prefix)?;
+        // A location may name a pool declared later in the file, so
+        // references can only be checked once everything is parsed.
+        let pools = &self.server.concurrency_limits;
+        for l in self.vhosts.iter().flat_map(|v| &v.locations) {
+            for r in &l.concurrency_limits {
+                let ConcurrencyLimitRef::Named { name: pool, line } = r
+                else {
+                    continue;
+                };
+                if !pools.contains_key(pool) {
+                    let known: Vec<&str> =
+                        pools.keys().map(String::as_str).collect();
+                    bail!(
+                        "{}unknown concurrency-limit pool '{pool}' in \
+                         location '{}'{}",
+                        loc(name, *line),
+                        l.path,
+                        parse::did_you_mean(pool, &known)
+                    );
+                }
+            }
+        }
         // Every scope chain that defines variables gets its own
         // effective table; build each so scope-specific errors
         // (duplicates, cycles through an override) surface here.

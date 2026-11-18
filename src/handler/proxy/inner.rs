@@ -380,12 +380,19 @@ impl InnerProxyClient {
     /// `super::upgrade` in a follow-up commit.
     pub(crate) async fn serve_upgrade(
         &self,
-        req: Request<ReqBody>,
+        mut req: Request<ReqBody>,
         matched_prefix: &str,
         marker: super::upgrade::UpgradeRequest,
     ) -> HttpResponse {
         use super::upgrade::{InboundProtocol, h1_upgraded, pump};
         use crate::error::bytes_body;
+        // Concurrency slots the listener took for this request.  The
+        // tunnel outlives the response, so the pump task below owns
+        // them until it exits; on any earlier return they drop here
+        // and the slots follow the response instead.
+        let tunnel_hold = req
+            .extensions_mut()
+            .remove::<crate::concurrency::TunnelHold>();
         let backend_req = match self
             .prepare_backend_upgrade_request(req, matched_prefix)
         {
@@ -515,6 +522,7 @@ impl InnerProxyClient {
         let on_upgrade_arc = marker.on_upgrade.clone();
         let inbound = marker.inbound;
         tokio::spawn(async move {
+            let _tunnel_hold = tunnel_hold;
             // Recover a poisoned lock: the guarded value is an
             // Option we are taking anyway, so a panic in another
             // task must not strand this upgrade.

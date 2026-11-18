@@ -1707,3 +1707,89 @@
                 .is_none()
         );
     }
+
+    // -- concurrency limits -------------------------------------------
+
+    fn route_limits(
+        router: &Router,
+        path: &str,
+    ) -> Vec<Arc<ConcurrencyLimit>> {
+        let mut req = hyper::Request::builder()
+            .uri(path)
+            .header("host", "a.com")
+            .body(())
+            .unwrap();
+        router
+            .route(&mut req, "tcp://0.0.0.0:80")
+            .unwrap()
+            .concurrency_limits
+    }
+
+    #[test]
+    fn named_concurrency_pool_is_shared_across_locations() {
+        let config = make_config(
+            r#"
+            server { concurrency-limit "shared" max=4 }
+            listener "tcp://0.0.0.0:80"
+            vhost "a.com" {
+                location "/a/" {
+                    concurrency-limit "shared"
+                    static root="."
+                }
+                location "/b/" {
+                    concurrency-limit "shared"
+                    concurrency-limit max=4
+                    static root="."
+                }
+                location "/c/" {
+                    concurrency-limit max=4
+                    static root="."
+                }
+            }
+            "#,
+        );
+        let router = make_router(&config);
+        let a = route_limits(&router, "/a/x");
+        let b = route_limits(&router, "/b/x");
+        let c = route_limits(&router, "/c/x");
+        assert_eq!((a.len(), b.len(), c.len()), (1, 2, 1));
+        // One instance behind both references: that is the sharing.
+        assert!(Arc::ptr_eq(&a[0], &b[0]));
+        assert_eq!(a[0].name, "shared");
+        // Inline pools are private to their location.
+        assert!(!Arc::ptr_eq(&b[1], &c[0]));
+    }
+
+    #[test]
+    fn concurrency_limit_config_is_carried_to_the_route() {
+        let config = make_config(
+            r#"
+            listener "tcp://0.0.0.0:80"
+            vhost "a.com" {
+                location "/" {
+                    concurrency-limit max=2 queue=3 queue-timeout=7 \
+                        status=429 dry-run=#true {
+                        key "client-ip"
+                    }
+                    static root="."
+                }
+            }
+            "#,
+        );
+        let l = &route_limits(&make_router(&config), "/")[0];
+        assert_eq!(l.max, 2);
+        assert_eq!(
+            l.queue,
+            Some(crate::concurrency::Queue {
+                max_waiters: 3,
+                timeout: std::time::Duration::from_secs(7),
+            })
+        );
+        assert_eq!(l.status, hyper::StatusCode::TOO_MANY_REQUESTS);
+        assert!(l.dry_run);
+        assert!(matches!(
+            l.key,
+            Some(crate::rate_limit::RateLimitKey::ClientIp)
+        ));
+    }
+
