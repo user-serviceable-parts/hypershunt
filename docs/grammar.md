@@ -169,6 +169,7 @@ Examples:
 - [`<policy-def>`](#policy-def)
 - [`<concurrency-limit-def>`](#concurrency-limit-def)
 - [`<variable-def>`](#variable-def)
+- `"cache"` ( `max-size=`[`<integer>`](#integer) )?
 - [`<error-page-def>`](#error-page-def)
 - [`<access-log-block>`](#access-log-block)
 - [`<tracing-block>`](#tracing-block)
@@ -552,6 +553,7 @@ listed in [`<l4-proxy-opt>`](#l4-proxy-opt).
 - [`<response-headers-block>`](#response-headers-block)
 - [`<rate-limit-block>`](#rate-limit-block)
 - [`<concurrency-limit-block>`](#concurrency-limit-block)
+- [`<cache-block>`](#cache-block)
 - [`<match-block>`](#match-block)
 - [`<rewrite-directive>`](#rewrite-directive)
 - [`<variable-def>`](#variable-def)
@@ -594,6 +596,14 @@ The second form refers to a pool defined by a
 `queue-timeout=`( [`<integer>`](#integer) | [`<string>`](#string) ) )?
 ( `status=`[`<integer>`](#integer) )?
 ( `dry-run=`[`<boolean>`](#boolean) )?
+
+### `cache-block`
+
+`"cache"` ( `ttl=`[`<integer>`](#integer) )?
+( `max-object-size=`[`<integer>`](#integer) )?
+( `key=`[`<string>`](#string) )?
+( `honor-client-cache-control=`[`<boolean>`](#boolean) )?
+( `{` ( `"method"` ( `"GET"` | `"HEAD"` ) )* `}` )?
 
 ### `rewrite-directive`
 

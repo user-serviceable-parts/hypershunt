@@ -1804,18 +1804,33 @@ applies).
 **Property** on [`listener`](#listener) and on
 [`location`](#location).  Optional integer.
 
-Cap on inbound request body size in bytes.  Bodies with a
-`Content-Length` larger than the cap return `413` before the
-handler runs; chunked bodies that exceed the cap mid-stream also
-return `413`.  When set on both `listener` and `location`, the
-location value wins (and can only be smaller in practice — the
-listener cap is enforced first, before routing).
+Cap on inbound request body size in bytes.  A request whose
+`Content-Length` is larger than the cap gets `413` before the
+handler runs.
+
+That check reads the declared length only.  What happens to a body
+sent without a `Content-Length` depends on the protocol:
+
+- **HTTP/1.1 and HTTP/2** -- the body (chunked transfer encoding, or
+  a stream that omits the header) is not measured and is not limited
+  by this setting.
+- **HTTP/3** -- the listener cap is also applied while the body
+  streams: once it is exceeded the body is cut short, with no `413`.
+  The handler or backend sees a truncated body.  A location-level
+  cap is not applied this way.
+
+When set on both `listener` and `location`, both apply.  The
+listener cap is enforced first, before routing, so a location can
+tighten the cap but not relax it.
 
 ```kdl
-listener "tcp://[::]:80" max-request-body=1048576 { }
+listener "tcp://[::]:80" max-request-body=104857600 { }
 vhost "example.com" {
-    location "/upload/" max-request-body=104857600 {
+    location "/upload/" {
         proxy { upstream "http://uploader:9000" }
+    }
+    location "/login/" max-request-body=65536 {
+        proxy { upstream "http://auth:9000" }
     }
 }
 ```
@@ -2853,13 +2868,22 @@ rate-limit rate=10 per="second" { key "header" "X-API-Key" }
 
 Missing-header / anonymous-user requests share the `""` bucket.
 
+`key "user"` only sees a username when the request has been
+authenticated, and a location authenticates a request only when
+something on it needs the identity: a [`policy`](#policy-location)
+with a `user`, `group` or `authenticated` rule, or a header rule or
+variable that uses the username or groups.  On a location with
+neither, every request counts as anonymous and lands in the shared
+`""` bucket, even if it carries valid credentials.
+
 ##### name
 
 **Property** on [`rate-limit`](#rate-limit).  Optional string.
 
-Display name surfaced on the `/status` page.  When unset, hypershunt
-synthesises one from the location path and the limiter's
-declaration order (`<loc>-rl-<idx>`).
+Name that identifies the limiter in the `rate-limited` security
+log event (its `rule` field).  When unset, hypershunt synthesises
+one from the location path and the limiter's declaration order
+(`<loc>-rl-<idx>`).
 
 #### concurrency-limit
 
@@ -2965,8 +2989,10 @@ real traffic before enforcing it.  A dry-run pool never queues.
 Splits the pool by a request attribute, so each value gets its own
 `max` slots (and its own queue).  The forms are those of the
 rate-limit [`key`](#key): `"client-ip"`, `"user"`, or `"header"`
-followed by a header name.  Without a `key`, every request shares
-one pool.
+followed by a header name, and the same caveat applies to
+`key "user"`: the location must authenticate the request for the
+username to be known.  Without a `key`, every request shares one
+pool.
 
 ```kdl
 concurrency-limit max=4                              // shared

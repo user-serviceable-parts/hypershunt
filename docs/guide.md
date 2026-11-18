@@ -2077,16 +2077,24 @@ regardless of which IP they're calling from.
   [`accept-proxy-protocol`](reference.md#accept-proxy-protocol)
   for accurate IPs when fronted by an LB.
 - `"user"` — bucket per authenticated username.  Anonymous
-  requests share the empty-string bucket.
+  requests share the empty-string bucket.  The location must
+  authenticate the request for this to work: give it a
+  [`policy`](reference.md#policy-location) with a `user`, `group`
+  or `authenticated` rule.  Without one, every request is treated
+  as anonymous.
 - `"header" "X-API-Key"` — bucket per value of a named header.
   Useful for API-key throttling.
 
 ### Surfacing on `/status`
 
-The built-in status page lists every active limiter (per
-location, per key value) with the current bucket level.  Set
-[`name=`](reference.md#name) on the rate-limit block to give it
-a friendly label.
+The built-in status page shows a "Rate Limiting" card with two
+server-wide totals: requests denied with `429`, and the number of
+live buckets across all limiters (refreshed once a minute).  It
+does not break these down per limiter or per key.  To see which
+limiter fired, read the `rate-limited`
+[security event](#security-signals-fail2ban): its `rule` field carries the
+limiter's name, which you can set with
+[`name=`](reference.md#name) on the rate-limit block.
 
 **See also:** [Reference — rate-limit](reference.md#rate-limit),
 [Status, health, metrics](#status-health-metrics).
@@ -2579,7 +2587,7 @@ The page shows:
 
 - Process info (version, pid, uptime, listeners).
 - Per-vhost request and latency counters; latency histograms.
-- Active rate-limit buckets with current levels.
+- Rate-limit totals: requests denied and live buckets.
 - Concurrency-limit slots in use, requests waiting, and rejections.
 - Certificate status (issuer, SAN list, `notAfter`, OCSP
   freshness).

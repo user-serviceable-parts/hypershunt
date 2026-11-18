@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 /// One configured rate-limit, with its bucket state.
 pub struct RateLimitRule {
-    /// Human-readable name for logs / metrics.  Synthesised when
-    /// the operator didn't supply one (`loc-<i>-rl-<j>`).
+    /// Human-readable name for logs.  Synthesised when the operator
+    /// didn't supply one (`<location path>-rl-<index>`).
     pub name: String,
     /// Tokens added per second, derived from config `rate / per-window`.
     pub rate_per_sec: f64,

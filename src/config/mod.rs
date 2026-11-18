@@ -539,7 +539,9 @@ pub struct ListenerConfig {
     // New connections are deferred (not dropped) at the limit.
     pub max_connections: Option<u32>,
     // Reject requests whose Content-Length exceeds this (bytes).
-    // None = unlimited.  Checked before any handler runs.
+    // None = unlimited.  Checked before any handler runs.  Bodies
+    // sent without a Content-Length are not measured on h1/h2; the
+    // h3 body adapter truncates them at this cap instead.
     pub max_request_body: Option<u64>,
     // Pre-computed `Alt-Svc` header value to auto-inject on responses
     // from this TCP/TLS listener.  Populated by `Config::parse` when a
@@ -923,7 +925,8 @@ pub enum MatchPredicateConfig {
 /// `rate_limit::RateLimitRule` (with its bucket map) in router.rs.
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
-    /// Display name; defaults to `loc-<i>-rl-<j>` when not given.
+    /// Display name; defaults to `<location path>-rl-<index>` when
+    /// not given.
     pub name: String,
     /// Tokens added per second (`rate / per-window-seconds`).
     pub rate_per_sec: f64,
