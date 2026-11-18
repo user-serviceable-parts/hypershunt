@@ -2091,6 +2091,122 @@ a friendly label.
 **See also:** [Reference — rate-limit](reference.md#rate-limit),
 [Status, health, metrics](#status-health-metrics).
 
+## Concurrency limiting
+
+A [rate limit](#rate-limiting) bounds how *often* requests arrive.
+[`concurrency-limit`](reference.md#concurrency-limit) bounds how
+many are being served *at the same time*, which is what protects an
+endpoint whose requests are slow or expensive: a report generator, a
+backend with a small worker pool, a large download.
+
+### Protecting an expensive location
+
+```kdl
+location "/report/" {
+    concurrency-limit max=8
+    proxy { upstream "http://reports.internal:9000" }
+}
+```
+
+At most eight requests run against `/report/` at once.  A ninth is
+answered immediately with `503` and `Retry-After: 1`; the rest of
+the site is unaffected.  A request holds its slot until its response
+body has been sent in full, so a slow download or a streamed
+response keeps counting for as long as it is still being delivered.
+
+### Waiting instead of failing
+
+```kdl
+location "/report/" {
+    concurrency-limit max=8 queue=32 queue-timeout=10
+    proxy { upstream "http://reports.internal:9000" }
+}
+```
+
+With a [`queue`](reference.md#queue-concurrency-limit), up to 32
+requests wait for a slot instead of being turned away, in arrival
+order.  Each waits at most
+[`queue-timeout`](reference.md#queue-timeout-concurrency-limit);
+after that, or when the queue itself is full, the request is
+rejected as before.  Keep `queue-timeout` shorter than the
+listener's `handler` timeout, which also covers time spent waiting.
+
+### One limit per client
+
+```kdl
+location "/export/" {
+    concurrency-limit max=2 { key "client-ip" }
+    concurrency-limit max=20
+    proxy { upstream "http://export.internal:9000" }
+}
+```
+
+A [`key`](reference.md#key-concurrency-limit) gives each client (or
+user, or header value) its own slots, so one client cannot occupy
+the whole location.  Limits stack and are taken in order: put the
+keyed limit first, so a client that is over its own share is turned
+away before it takes one of the shared slots.
+
+### One pool across several locations
+
+```kdl
+server {
+    concurrency-limit "reports" max=8
+}
+vhost "app.example.com" {
+    location "/report/" {
+        concurrency-limit "reports"
+        proxy { upstream "http://reports.internal:9000" }
+    }
+    location "/export/" {
+        concurrency-limit "reports"
+        proxy { upstream "http://reports.internal:9000" }
+    }
+}
+```
+
+A pool [declared in `server`](reference.md#concurrency-limit-server)
+is shared by every location that names it, across vhosts and
+listeners.  Use it when the thing being protected is a backend
+rather than a URL prefix.
+
+### Trying a limit out
+
+```kdl
+concurrency-limit max=8 dry-run=#true
+```
+
+In [dry-run](reference.md#dry-run-concurrency-limit) mode the limit
+rejects nothing.  Requests that *would* have been rejected are
+logged and counted, so you can watch
+`hypershunt_concurrency_limit_dry_run_total` under real traffic and
+pick `max` before enforcing it.
+
+### What counts as in flight
+
+- A response that hypershunt compresses is buffered first, so its
+  slot is returned once the backend has finished producing it.
+- A response served from the [response cache](#response-caching)
+  still takes a slot for the time it takes to send.
+- A WebSocket or other upgraded connection holds its slot for as
+  long as the tunnel stays open.
+- A [reload](#reloading-and-zero-downtime-upgrade) starts every pool
+  empty.  Requests admitted before the reload finish normally but
+  are not counted against the new limits.
+
+### Watching it
+
+The status page shows a "Concurrency Limiting" card (slots in use,
+requests waiting, and the rejected / queued / dry-run totals) once
+any limit has been exercised; the same numbers are in the status
+JSON under `concurrency_limit` and on the
+[`metrics`](reference.md#metrics) endpoint.  Each rejection is also
+logged at WARN with the pool name, location and reason (`full` or
+`queue-timeout`).
+
+**See also:** [Reference -- concurrency-limit](reference.md#concurrency-limit),
+[named pools](reference.md#concurrency-limit-server).
+
 ## Response caching
 
 A [`cache`](reference.md#cache-location) block on a location stores
@@ -2260,7 +2376,9 @@ bidirectional byte pump until either side closes.
 
 Authentication, [`policy`](reference.md#policy-location), and
 [`rate-limit`](reference.md#rate-limit) run *before* the upgrade
-completes.  Retries and load-balancer picks happen at
+completes.  A [`concurrency-limit`](reference.md#concurrency-limit)
+slot taken for the upgrade request is held until the tunnel closes.
+Retries and load-balancer picks happen at
 upgrade-request time only — once the tunnel is open, retries
 are off.
 
@@ -2462,6 +2580,7 @@ The page shows:
 - Process info (version, pid, uptime, listeners).
 - Per-vhost request and latency counters; latency histograms.
 - Active rate-limit buckets with current levels.
+- Concurrency-limit slots in use, requests waiting, and rejections.
 - Certificate status (issuer, SAN list, `notAfter`, OCSP
   freshness).
 - Upstream pool stats (in-flight requests, ejection status).
@@ -2796,6 +2915,7 @@ in-flight requests drain (capped by
 [`graceful-drain-timeout`](reference.md#graceful-drain-timeout)).
 
 Reload-safe edits: vhosts, locations, policies, rate-limits,
+concurrency limits,
 certificates (including triggering a new ACME issuance), listener
 add/remove.
 
@@ -2875,6 +2995,7 @@ Across both reload and upgrade:
 
 What doesn't:
 - In-memory rate-limit bucket levels (rebuilt on first miss).
+- Concurrency-limit slot counts (every pool starts empty).
 - Active health-check probe schedules (resume from the new
   process's startup).
 - WebSocket and other long-lived upgrade tunnels under SIGUSR2

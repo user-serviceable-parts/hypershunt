@@ -462,6 +462,12 @@ function updateExtra(d){
   if(d.rate_limit){
     setText('val-rl-triggers',fmt(d.rate_limit.triggers));
     setText('val-rl-keys',fmt(d.rate_limit.active_keys));}
+  if(d.concurrency_limit){var cl=d.concurrency_limit;
+    setText('val-cl-in-flight',fmt(cl.in_flight));
+    setText('val-cl-waiting',fmt(cl.waiting));
+    setText('val-cl-rejected',fmt(cl.rejected));
+    setText('val-cl-queued',fmt(cl.queued));
+    setText('val-cl-dry-run',fmt(cl.dry_run));}
   if(d.geoip){
     setText('val-geoip',fmt(d.geoip.lookups));
     setText('val-geoip-miss',fmt(d.geoip.misses));}
@@ -1533,9 +1539,9 @@ fn network_section(s: &Snapshot) -> String {
     )
 }
 
-/// OIDC, rate-limit, and GeoIP cards.  Each appears only when its own
-/// counters show activity, so a deployment that uses one but not the
-/// others sees just the relevant card.
+/// OIDC, rate-limit, concurrency-limit, and GeoIP cards.  Each
+/// appears only when its own counters show activity, so a deployment
+/// that uses one but not the others sees just the relevant card.
 fn security_extra_section(s: &Snapshot) -> String {
     let oidc_active = s.oidc.discoveries > 0
         || s.oidc.refreshes > 0
@@ -1544,8 +1550,14 @@ fn security_extra_section(s: &Snapshot) -> String {
         || s.oidc.discovery_failures > 0
         || s.oidc.bearer_failures > 0;
     let rl_active = s.rate_limit.triggers > 0 || s.rate_limit.active_keys > 0;
+    let c = &s.concurrency;
+    let cl_active = c.in_flight > 0
+        || c.waiting > 0
+        || c.rejected > 0
+        || c.queued > 0
+        || c.dry_run > 0;
     let geo_active = s.geoip.lookups > 0;
-    if !oidc_active && !rl_active && !geo_active {
+    if !oidc_active && !rl_active && !cl_active && !geo_active {
         return String::new();
     }
     let mut cards = String::new();
@@ -1582,6 +1594,24 @@ fn security_extra_section(s: &Snapshot) -> String {
                     &fmt_num(s.rate_limit.triggers)),
                 mrow("Active bucket keys", "val-rl-keys",
                     &fmt_num(s.rate_limit.active_keys)),
+            ),
+        ));
+    }
+    if cl_active {
+        cards.push_str(&mcard(
+            "Concurrency Limiting",
+            &format!(
+                "{}{}{}{}{}",
+                mrow("Slots in use", "val-cl-in-flight",
+                    &fmt_num(c.in_flight.max(0) as u64)),
+                mrow("Requests waiting", "val-cl-waiting",
+                    &fmt_num(c.waiting.max(0) as u64)),
+                mrow("Requests rejected", "val-cl-rejected",
+                    &fmt_num(c.rejected)),
+                mrow("Requests queued", "val-cl-queued",
+                    &fmt_num(c.queued)),
+                mrow("Dry-run would-reject", "val-cl-dry-run",
+                    &fmt_num(c.dry_run)),
             ),
         ));
     }
@@ -1751,7 +1781,8 @@ mod tests {
     use crate::handler::status::LocationSummary;
     use crate::metrics::{
         AcmeSnap, BackendSnap, ClassSnapshot, CompressionSnap, GeoipSnap,
-        HttpConnSnap, OcspSnap, OidcSnap, RateLimitSnap, Snapshot, StaticSnap,
+        ConcurrencySnap, HttpConnSnap, OcspSnap, OidcSnap, RateLimitSnap,
+        Snapshot, StaticSnap,
         TlsSnap,
     };
 
@@ -1793,10 +1824,16 @@ mod tests {
         let s = Snapshot {
             oidc: OidcSnap { discoveries: 1, ..Default::default() },
             rate_limit: RateLimitSnap { triggers: 3, active_keys: 2 },
+            concurrency: ConcurrencySnap {
+                rejected: 4,
+                ..Default::default()
+            },
             geoip: GeoipSnap { lookups: 7, misses: 1 },
             ..Default::default()
         };
         let html = security_extra_section(&s);
+        assert!(html.contains("Concurrency Limiting"));
+        assert!(html.contains("val-cl-rejected"));
         assert!(html.contains("OIDC / OAuth"));
         assert!(html.contains("Rate Limiting"));
         assert!(html.contains("GeoIP"));

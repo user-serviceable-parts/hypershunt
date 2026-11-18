@@ -239,6 +239,15 @@ pub struct RateLimitSnap {
 }
 
 #[derive(Clone, Copy, Default)]
+pub struct ConcurrencySnap {
+    pub rejected: u64,
+    pub queued: u64,
+    pub dry_run: u64,
+    pub in_flight: i64,
+    pub waiting: i64,
+}
+
+#[derive(Clone, Copy, Default)]
 pub struct CacheSnap {
     pub hits: u64,
     pub misses: u64,
@@ -364,6 +373,7 @@ pub struct Snapshot {
     pub lb: LbSnap,
     pub upstream: UpstreamSnap,
     pub rate_limit: RateLimitSnap,
+    pub concurrency: ConcurrencySnap,
     pub cache: CacheSnap,
     pub oidc: OidcSnap,
     pub http_conns: HttpConnSnap,
@@ -839,6 +849,17 @@ pub struct Metrics {
     // refreshed by tick_loop.
     pub rate_limit_triggers: AtomicU64,
     pub rate_limit_active_keys: AtomicU64,
+    // Concurrency-limit counters and gauges, summed over every
+    // pool.  `rejected` counts requests turned away because a pool
+    // (and its queue, if any) was full or the queue wait expired;
+    // `queued` counts requests that had to wait; `dry_run` counts
+    // would-be rejections admitted by a dry-run pool.  `in_flight`
+    // is slots held right now, `waiting` requests queued right now.
+    pub concurrency_rejected: AtomicU64,
+    pub concurrency_queued: AtomicU64,
+    pub concurrency_dry_run: AtomicU64,
+    pub concurrency_in_flight: AtomicI64,
+    pub concurrency_waiting: AtomicI64,
     // Response-cache counters.  `hits`/`misses` count read-through
     // outcomes; `stores` counts responses written into the cache;
     // `bypass` counts cacheable-method responses that were ineligible
@@ -1014,6 +1035,11 @@ impl Metrics {
             proxy_lb_health_recoveries: AtomicU64::new(0),
             rate_limit_triggers: AtomicU64::new(0),
             rate_limit_active_keys: AtomicU64::new(0),
+            concurrency_rejected: AtomicU64::new(0),
+            concurrency_queued: AtomicU64::new(0),
+            concurrency_dry_run: AtomicU64::new(0),
+            concurrency_in_flight: AtomicI64::new(0),
+            concurrency_waiting: AtomicI64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             cache_stores: AtomicU64::new(0),
@@ -1340,6 +1366,7 @@ impl Metrics {
             lb: self.lb_snap(),
             upstream: self.upstream_snap(),
             rate_limit: self.rate_limit_snap(),
+            concurrency: self.concurrency_snap(),
             cache: self.cache_snap(),
             oidc: self.oidc_snap(),
             http_conns: HttpConnSnap {
@@ -1510,6 +1537,17 @@ impl Metrics {
         RateLimitSnap {
             triggers: self.rate_limit_triggers.load(Ordering::Relaxed),
             active_keys: self.rate_limit_active_keys.load(Ordering::Relaxed),
+        }
+    }
+
+    fn concurrency_snap(&self) -> ConcurrencySnap {
+        let r = Ordering::Relaxed;
+        ConcurrencySnap {
+            rejected: self.concurrency_rejected.load(r),
+            queued: self.concurrency_queued.load(r),
+            dry_run: self.concurrency_dry_run.load(r),
+            in_flight: self.concurrency_in_flight.load(r),
+            waiting: self.concurrency_waiting.load(r),
         }
     }
 

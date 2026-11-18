@@ -181,6 +181,19 @@ key share one token bucket.
 The maximum number of requests a rate-limit bucket allows to arrive at
 once before the steady `rate` throttles them.  Defaults to the rate.
 
+## Concurrency limit
+
+A cap on how many requests a location (or a named pool shared by
+several locations) serves [at the same time](guide.md#concurrency-limiting).
+A request holds one *slot* from before its handler runs until its
+response body has been sent.
+
+## Queue (concurrency limit)
+
+The optional waiting room of a concurrency limit: requests that find
+every slot taken wait here, in arrival order, for at most
+`queue-timeout`.  Without a queue they are rejected at once.
+
 ## state-dir
 
 The directory where hypershunt persists data that must survive restarts

@@ -14,10 +14,12 @@ use crate::access::{AuthProvider, EvalContext, PolicyOutcome};
 use crate::access_log::AccessLogRecord;
 use crate::auth::{Authenticator, Principal};
 use crate::compress;
+use crate::concurrency::{Admission, Held, TunnelHold};
 use crate::config::Timeouts;
 use crate::error::{
     BoxBody, ReqBody, bytes_body, response_400, response_404, response_413,
-    response_429, response_503_retry, response_redirect, response_status,
+    response_429, response_503_retry, response_redirect, response_retry,
+    response_status,
     response_www_auth,
 };
 use crate::geoip;
@@ -43,6 +45,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
+
+// `Retry-After` sent with a concurrency-limit rejection.  Unlike a
+// token bucket there is no refill time to compute: a slot frees
+// whenever some in-flight request finishes, so advertise the
+// shortest polite back-off.
+const CONCURRENCY_RETRY_AFTER_SECS: u64 = 1;
 
 // Wraps the per-request authenticator so it implements AuthProvider
 // for the access evaluator (which doesn't know about hyper::Request).
@@ -1166,6 +1174,57 @@ impl HypershuntService {
                             );
                         }
 
+                        // Concurrency gate: take a slot in every
+                        // configured pool, in declaration order.  It
+                        // sits after the rate limit so a request that
+                        // is about to get a 429 never takes a slot or
+                        // a queue place.
+                        let mut permits = Vec::new();
+                        for limit in &route.concurrency_limits {
+                            let key =
+                                limit.key_string(&req_ctx, req.headers());
+                            match limit.acquire(key, &state.metrics).await
+                            {
+                                Ok(Admission::Permit(p)) => permits.push(p),
+                                Ok(Admission::DryRun) => tracing::warn!(
+                                    %peer,
+                                    pool = %limit.name,
+                                    location = %route.matched_prefix,
+                                    "concurrency limit reached (dry run)"
+                                ),
+                                Err(why) => {
+                                    tracing::warn!(
+                                        %peer,
+                                        pool = %limit.name,
+                                        location = %route.matched_prefix,
+                                        reason = %why,
+                                        "concurrency limit reached"
+                                    );
+                                    return (
+                                        response_retry(
+                                            limit.status,
+                                            CONCURRENCY_RETRY_AFTER_SECS,
+                                        ),
+                                        String::from("-"),
+                                    );
+                                }
+                            }
+                        }
+                        let held: Option<Held> = (!permits.is_empty())
+                            .then(|| Arc::new(permits));
+                        // An upgraded connection outlives its response,
+                        // so hand the tunnel its own claim on the slots.
+                        if let Some(h) = &held
+                            && req
+                                .extensions()
+                                .get::<crate::handler::proxy::upgrade
+                                    ::UpgradeRequest>()
+                                .is_some()
+                        {
+                            req.extensions_mut()
+                                .insert(TunnelHold(h.clone()));
+                        }
+
                         // Apply request-header rules before the handler
                         // consumes the request.
                         if let Some(rules) = &route.header_rules
@@ -1215,6 +1274,12 @@ impl HypershuntService {
                                 )
                                 .await
                         };
+
+                        // Keep the slots until the body has been
+                        // sent, not just until the head is ready.
+                        if let Some(h) = held {
+                            resp = crate::concurrency::hold(resp, h);
+                        }
 
                         // Apply response-header rules to the response
                         // before it reaches the client.

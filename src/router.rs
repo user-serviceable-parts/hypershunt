@@ -5,8 +5,10 @@
 // a vhost, the longest matching location prefix wins.
 
 use crate::access::{PolicyBlock, PolicyRule, Predicate};
+use crate::concurrency::ConcurrencyLimit;
 use crate::config::{
-    BasicAuthConfig, Config, HeaderOpConfig, PolicyRuleDef, VHostConfig,
+    BasicAuthConfig, ConcurrencyLimitConfig, ConcurrencyLimitRef, Config,
+    HeaderOpConfig, PolicyRuleDef, VHostConfig,
 };
 use crate::handler::Handler;
 use crate::handler::status::{
@@ -41,6 +43,9 @@ pub struct Route {
     /// Rate-limit rules; evaluated in declaration order, first
     /// failing rule short-circuits with 429.
     pub rate_limits: Vec<Arc<crate::rate_limit::RateLimitRule>>,
+    /// Concurrency pools the request must hold a slot in, taken in
+    /// declaration order; the first full pool rejects the request.
+    pub concurrency_limits: Vec<Arc<ConcurrencyLimit>>,
     /// Per-location override for the listener-wide `max-request-
     /// body`.  When `Some`, requests with `Content-Length` over the
     /// listed value get a 413 after routing resolves the location.
@@ -77,6 +82,7 @@ struct Location {
     basic_auth: Option<Arc<BasicAuthConfig>>,
     header_rules: Option<Arc<HeaderRules>>,
     rate_limits: Vec<Arc<crate::rate_limit::RateLimitRule>>,
+    concurrency_limits: Vec<Arc<ConcurrencyLimit>>,
     max_request_body: Option<u64>,
     // None means "accepts every request"; Some only accepts when
     // every predicate inside the matcher is satisfied.  When a
@@ -162,6 +168,18 @@ impl Router {
         // them via apply.
         let named_policies = resolve_named_policies(&config.server.policies)?;
 
+        // Build each named concurrency pool exactly once: locations
+        // that reference it clone this one `Arc`, and sharing that
+        // instance is what makes them draw on the same slots.
+        let concurrency_pools = config
+            .server
+            .concurrency_limits
+            .iter()
+            .map(|(name, cfg)| {
+                Ok((name.clone(), concurrency_limit_from_config(cfg)?))
+            })
+            .collect::<anyhow::Result<HashMap<_, _>>>()?;
+
         // Shared, initially-empty reverse-proxy pool registry; filled as
         // handlers are built and stored once the build completes.  The
         // StatusHandler clones this same handle, so it sees every pool
@@ -182,6 +200,7 @@ impl Router {
                 summary,
                 cert_state,
                 &named_policies,
+                &concurrency_pools,
                 &lb_registry,
                 &mut lb_pools,
                 &var_table,
@@ -292,6 +311,7 @@ impl Router {
                 basic_auth: loc.basic_auth.clone(),
                 header_rules: loc.header_rules.clone(),
                 rate_limits: loc.rate_limits.clone(),
+                concurrency_limits: loc.concurrency_limits.clone(),
                 max_request_body: loc.max_request_body,
                 cache_policy: loc.cache_policy.clone(),
                 vars: loc.vars.clone(),
@@ -597,6 +617,7 @@ fn build_vhost(
     summary: &Arc<ServerSummary>,
     cert_state: Option<&crate::cert::state::SharedCertState>,
     named_policies: &HashMap<String, Vec<PolicyRule>>,
+    pools: &HashMap<String, Arc<ConcurrencyLimit>>,
     lb_registry: &SharedLbRegistry,
     lb_pools: &mut Vec<LbPoolEntry>,
     server_table: &Arc<VarTable>,
@@ -682,6 +703,24 @@ fn build_vhost(
             .iter()
             .map(rate_limit_rule_from_config)
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let concurrency_limits = loc
+            .concurrency_limits
+            .iter()
+            .map(|r| match r {
+                ConcurrencyLimitRef::Inline(cfg) => {
+                    concurrency_limit_from_config(cfg)
+                }
+                // validate() rejects unknown names, but the router
+                // can be built from an unvalidated config in tests.
+                ConcurrencyLimitRef::Named { name, .. } => {
+                    pools.get(name).cloned().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown concurrency-limit pool '{name}'"
+                        )
+                    })
+                }
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let matcher = loc
             .matcher
             .as_ref()
@@ -736,6 +775,7 @@ fn build_vhost(
             basic_auth: loc.auth.as_ref().map(|a| Arc::new(a.clone())),
             header_rules,
             rate_limits,
+            concurrency_limits,
             max_request_body: loc.max_request_body,
             log_fields,
             matcher,
@@ -775,29 +815,60 @@ fn handler_kind(h: &crate::config::HandlerConfig) -> HandlerKind {
 fn rate_limit_rule_from_config(
     cfg: &crate::config::RateLimitConfig,
 ) -> anyhow::Result<Arc<crate::rate_limit::RateLimitRule>> {
-    use crate::config::RateLimitKeyConfig;
-    let key = match &cfg.key {
-        RateLimitKeyConfig::ClientIp => {
-            crate::rate_limit::RateLimitKey::ClientIp
-        }
-        RateLimitKeyConfig::User => {
-            crate::rate_limit::RateLimitKey::User
-        }
-        RateLimitKeyConfig::Header(name) => {
-            let h = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "rate-limit invalid header name {name:?}: {e}"
-                    )
-                })?;
-            crate::rate_limit::RateLimitKey::Header(h)
-        }
-    };
     Ok(Arc::new(crate::rate_limit::RateLimitRule::new(
         cfg.name.clone(),
         cfg.rate_per_sec,
         cfg.burst,
+        rate_limit_key_from_config(&cfg.key)?,
+    )))
+}
+
+/// Resolve a configured key form.  Shared by rate limits and
+/// concurrency limits, which accept the same forms.
+fn rate_limit_key_from_config(
+    key: &crate::config::RateLimitKeyConfig,
+) -> anyhow::Result<crate::rate_limit::RateLimitKey> {
+    use crate::config::RateLimitKeyConfig;
+    use crate::rate_limit::RateLimitKey;
+    Ok(match key {
+        RateLimitKeyConfig::ClientIp => RateLimitKey::ClientIp,
+        RateLimitKeyConfig::User => RateLimitKey::User,
+        RateLimitKeyConfig::Header(name) => {
+            let h = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| {
+                    anyhow::anyhow!("invalid key header name {name:?}: {e}")
+                })?;
+            RateLimitKey::Header(h)
+        }
+    })
+}
+
+/// Convert one parsed pool definition into a live `ConcurrencyLimit`.
+/// Called once per definition, so a named pool referenced from
+/// several locations is one shared instance.
+fn concurrency_limit_from_config(
+    cfg: &ConcurrencyLimitConfig,
+) -> anyhow::Result<Arc<ConcurrencyLimit>> {
+    let key = cfg.key.as_ref().map(rate_limit_key_from_config).transpose()?;
+    let queue = cfg.queue_timeout_secs.filter(|_| cfg.queue > 0).map(
+        |secs| crate::concurrency::Queue {
+            max_waiters: cfg.queue,
+            timeout: std::time::Duration::from_secs(secs),
+        },
+    );
+    let status = hyper::StatusCode::from_u16(cfg.status).map_err(|e| {
+        anyhow::anyhow!(
+            "concurrency-limit invalid status {}: {e}",
+            cfg.status
+        )
+    })?;
+    Ok(Arc::new(ConcurrencyLimit::new(
+        cfg.name.clone(),
+        cfg.max,
         key,
+        queue,
+        status,
+        cfg.dry_run,
     )))
 }
 

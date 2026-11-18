@@ -132,6 +132,28 @@ client throttling everyone.  Stacked rules are AND-evaluated; the first
 to deny wins with `429` + `Retry-After`.  See
 [Rate limiting](guide.md#rate-limiting).
 
+## Concurrency limiting
+
+### Requests get `503` with `Retry-After: 1`
+
+A [`concurrency-limit`](reference.md#concurrency-limit) pool was full.
+The WARN log line names the pool and gives the reason: `full` (no
+free slot, and no queue or the queue was full too) or `queue-timeout`
+(the request waited the whole `queue-timeout`).  Check
+`hypershunt_concurrency_limit_in_flight` against the configured
+`max`.  A slot is held until the response *body* has been sent, and
+for the whole life of a WebSocket tunnel, so slow clients and
+long-lived connections keep slots busy.  With a `key`, anonymous
+users and requests missing the keyed header **share the empty-string
+pool**.  To see what a limit would do before enforcing it, set
+`dry-run=#true`.  See
+[Concurrency limiting](guide.md#concurrency-limiting).
+
+### Queued requests get `408` instead of the limit's status
+
+Time spent waiting in the queue counts against the listener's
+`handler` timeout.  Set `queue-timeout` lower than that timeout.
+
 ## Containers / permissions
 
 ### `Permission denied` reading mounted files

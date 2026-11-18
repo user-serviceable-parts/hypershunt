@@ -972,7 +972,8 @@ mod tests {
         for key in [
             "stream", "datagram", "compression", "tls", "geoip",
             "shutdown", "acme", "ocsp", "proxy_lb", "proxy_upstream",
-            "rate_limit", "oidc", "http_conns", "backends", "by_handler",
+            "rate_limit", "concurrency_limit", "oidc", "http_conns",
+            "backends", "by_handler",
             "by_vhost", "upstreams",
         ] {
             assert!(v.get(key).is_some(), "missing JSON key {key}");

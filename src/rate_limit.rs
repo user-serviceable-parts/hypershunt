@@ -39,6 +39,26 @@ pub enum RateLimitKey {
     Header(HeaderName),
 }
 
+impl RateLimitKey {
+    /// Derive the key string from the request.  Shared with the
+    /// concurrency limiter so both features key identically.
+    pub fn derive(
+        &self,
+        ctx: &RequestContext<'_>,
+        headers: &HeaderMap,
+    ) -> String {
+        match self {
+            RateLimitKey::ClientIp => ctx.client_ip.to_string(),
+            RateLimitKey::User => ctx.username.to_string(),
+            RateLimitKey::Header(name) => headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string(),
+        }
+    }
+}
+
 /// Per-key bucket state.  `tokens` is fractional so refills work
 /// at sub-token granularity.
 struct BucketEntry {
@@ -70,23 +90,6 @@ impl RateLimitRule {
         }
     }
 
-    /// Derive the key string for this rule from the request.
-    fn key_string(
-        &self,
-        ctx: &RequestContext<'_>,
-        headers: &HeaderMap,
-    ) -> String {
-        match &self.key {
-            RateLimitKey::ClientIp => ctx.client_ip.to_string(),
-            RateLimitKey::User => ctx.username.to_string(),
-            RateLimitKey::Header(name) => headers
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string(),
-        }
-    }
-
     /// Probe the bucket for `ctx`'s key.  Either consumes one
     /// token and returns Allow, or returns Deny with the seconds
     /// until at least one token is restored (>=1).
@@ -106,7 +109,7 @@ impl RateLimitRule {
         headers: &HeaderMap,
         now: Instant,
     ) -> RateLimitOutcome {
-        let key = self.key_string(ctx, headers);
+        let key = self.key.derive(ctx, headers);
         let mut state = self.state.lock().expect("rate-limit mutex");
         let entry = state.entry(key).or_insert(BucketEntry {
             tokens: self.burst,

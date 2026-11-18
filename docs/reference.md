@@ -1247,6 +1247,37 @@ vhost "internal.example.com" {
 }
 ```
 
+### concurrency-limit (server)
+
+**Child** of [`server`](#server).  Optional, repeatable.
+
+Defines a *named* concurrency pool.  Every location that refers to
+the pool by name draws on the same slots, so one limit can cover an
+expensive backend that is reached through several locations or
+vhosts.  The positional argument is the pool name; the properties
+and the optional `key` child are those of the location-level
+[`concurrency-limit`](#concurrency-limit) entry (except `name`,
+which the argument replaces).
+
+```kdl
+server {
+    concurrency-limit "reports" max=8 queue=16 queue-timeout=5
+}
+vhost "app.example.com" {
+    location "/report/" {
+        concurrency-limit "reports"
+        proxy { upstream "http://reports.internal:9000" }
+    }
+    location "/export/" {
+        concurrency-limit "reports"
+        proxy { upstream "http://reports.internal:9000" }
+    }
+}
+```
+
+Two pools may not share a name.  A pool that no location refers to
+is allowed and has no effect.
+
 ### variable
 
 **Child** of [`server`](#server), [`vhost`](#vhost), or
@@ -2571,6 +2602,7 @@ Locations are matched by longest-prefix; the longest matching
 prefix among the vhost's locations wins.
 
 Locations can also carry policies, header rules, rate limits,
+concurrency limits,
 request matchers, and URL rewrites.  Exactly one handler is
 required per location.
 
@@ -2828,6 +2860,131 @@ Missing-header / anonymous-user requests share the `""` bucket.
 Display name surfaced on the `/status` page.  When unset, hypershunt
 synthesises one from the location path and the limiter's
 declaration order (`<loc>-rl-<idx>`).
+
+#### concurrency-limit
+
+**Guide:** [Concurrency limiting](guide.md#concurrency-limiting).
+
+**Child** of [`location`](#location).  Optional, repeatable.
+
+Caps how many requests may be in flight at once.  A request takes a
+slot before its handler runs and gives it back when the response
+body has been sent in full, or the client goes away.  When no slot
+is free the request is rejected with `503 Service Unavailable` and
+`Retry-After: 1`, unless a [`queue`](#queue-concurrency-limit) lets
+it wait.
+
+The node has two forms:
+
+- **Inline pool** -- no positional argument; the properties below
+  define a pool private to this location.
+- **Reference** -- a single positional argument naming a pool
+  declared with [`concurrency-limit` in `server`](#concurrency-limit-server).
+  A reference takes no properties and no children.
+
+```kdl
+location "/report/" {
+    // at most 2 per client; up to 16 wait, each for at most 5 s
+    concurrency-limit max=2 queue=16 queue-timeout=5 {
+        key "client-ip"
+    }
+    // and no more than 8 across every location using the pool
+    concurrency-limit "reports"
+    proxy { upstream "http://reports.internal:9000" }
+}
+```
+
+Multiple `concurrency-limit` nodes stack: a request must hold a slot
+in every pool, taken in declaration order, and the first pool that
+refuses it decides the response.  Slots already taken are returned
+when a later pool refuses.
+
+The limit is checked after authentication, [`policy`](#policy-location)
+and [`rate-limit`](#rate-limit), so a request those would refuse
+never occupies a slot.
+
+##### max (concurrency-limit)
+
+**Property** on [`concurrency-limit`](#concurrency-limit).  Required
+integer, at least 1.
+
+Number of requests allowed in flight at once.  With a
+[`key`](#key-concurrency-limit), the number allowed per key value.
+
+##### queue (concurrency-limit)
+
+**Property** on [`concurrency-limit`](#concurrency-limit).  Optional
+integer.
+
+Number of requests allowed to wait for a slot when the pool is full
+(per key value, when keyed).  Waiting requests are served in arrival
+order.  A request that finds the queue full is rejected at once.
+Setting `queue` requires
+[`queue-timeout`](#queue-timeout-concurrency-limit).
+
+**Default:** `0` (never wait; reject as soon as the pool is full).
+
+##### queue-timeout (concurrency-limit)
+
+**Property** on [`concurrency-limit`](#concurrency-limit).  Required
+when [`queue`](#queue-concurrency-limit) is set; not allowed
+otherwise.
+
+Longest time one request may wait for a slot before it is rejected.
+An integer is seconds; a string takes a unit suffix (`"30s"`,
+`"2m"`).  Time spent waiting counts against the listener's
+[`handler`](#handler) timeout, so a wait longer than that timeout
+ends in `408` instead.
+
+##### status (concurrency-limit)
+
+**Property** on [`concurrency-limit`](#concurrency-limit).  Optional
+integer, `400`..`599`.
+
+Status code sent to a rejected request.  The response always carries
+`Retry-After: 1`.
+
+**Default:** `503`.
+
+##### dry-run (concurrency-limit)
+
+**Property** on [`concurrency-limit`](#concurrency-limit).  Optional
+boolean.
+
+When `#true`, a request that finds the pool full is logged and
+counted (`hypershunt_concurrency_limit_dry_run_total`) but served
+anyway, without occupying a slot.  Use it to size a limit against
+real traffic before enforcing it.  A dry-run pool never queues.
+
+**Default:** `#false`.
+
+##### key (concurrency-limit)
+
+**Child** of [`concurrency-limit`](#concurrency-limit).  Optional.
+
+Splits the pool by a request attribute, so each value gets its own
+`max` slots (and its own queue).  The forms are those of the
+rate-limit [`key`](#key): `"client-ip"`, `"user"`, or `"header"`
+followed by a header name.  Without a `key`, every request shares
+one pool.
+
+```kdl
+concurrency-limit max=4                              // shared
+concurrency-limit max=2 { key "client-ip" }
+concurrency-limit max=2 { key "user" }
+concurrency-limit max=2 { key "header" "X-API-Key" }
+```
+
+Missing-header / anonymous-user requests share the `""` pool.
+
+##### name (concurrency-limit)
+
+**Property** on an inline [`concurrency-limit`](#concurrency-limit).
+Optional string.
+
+Name used for the pool in log lines.  When unset, hypershunt
+synthesises one from the location path and the node's declaration
+order (`<loc>-cl-<idx>`).  A named pool uses its pool name.
 
 #### cache (location)
 
@@ -3315,7 +3472,7 @@ does any `2xx`.
 | 429 | 14 UNAVAILABLE | [`rate-limit`](#rate-limit) |
 | 3xx | 16 UNAUTHENTICATED | login redirect a client cannot follow |
 | 500 | 13 INTERNAL | internal error |
-| 502, 503, 504 | 14 UNAVAILABLE | no healthy upstream, backend error |
+| 502, 503, 504 | 14 UNAVAILABLE | no healthy upstream, backend error, [`concurrency-limit`](#concurrency-limit) (default status) |
 | anything else | 2 UNKNOWN | |
 
 The access log and the metrics keep recording the original HTTP
@@ -3804,6 +3961,7 @@ series:
 | `hypershunt_listener_tls_handshakes_total` | counter | `listener`, `result` (`ok`/`error`/`timeout`) |
 | `hypershunt_upstream_requests_total`, `_errors_total`, `_request_duration_seconds`, `_bytes_total`, `_in_flight`, `_healthy`, `_ejected`, `_consecutive_errors`, `_eject_remaining_seconds` | counters / gauges / histogram | `pool`, `upstream` (+`direction`) |
 | `hypershunt_proxy_upstream_duration_seconds`, `_bytes_total`, `_connect_errors_total` | histogram / counters | — (`direction`) |
+| `hypershunt_concurrency_limit_rejected_total`, `_queued_total`, `_dry_run_total`, `_in_flight`, `_waiting` | counters / gauges | (none) |
 | plus one series per existing counter group | | TLS, QUIC, cache, rate-limit, compression, streams, datagrams, auth/JWT/OIDC, ACME, OCSP, backends, static, geoip, shutdown, process |
 
 Notes:

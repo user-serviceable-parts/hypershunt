@@ -14,6 +14,7 @@ mod bootstrap;
 mod cache;
 mod cert;
 mod compress;
+mod concurrency;
 mod config;
 mod dns_provider;
 mod error;

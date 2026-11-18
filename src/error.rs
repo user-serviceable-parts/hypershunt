@@ -233,13 +233,23 @@ pub fn response_redirect(to: &str, code: u16) -> HttpResponse {
 /// so a polite client backs off rather than hammering hypershunt while
 /// the IdP comes back online.
 pub fn response_503_retry(secs: u64) -> HttpResponse {
+    response_retry(StatusCode::SERVICE_UNAVAILABLE, secs)
+}
+
+/// An error status carrying `Retry-After: <secs>`, for a refusal the
+/// client can expect to clear on its own.  Used by the concurrency
+/// limiter, whose rejection status is operator-configurable.
+pub fn response_retry(status: StatusCode, secs: u64) -> HttpResponse {
+    let body = format!(
+        "<h1>{} {}</h1>",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("Error")
+    );
     Response::builder()
-        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .status(status)
         .header("Retry-After", secs.to_string())
         .header("Content-Type", "text/html; charset=utf-8")
-        .body(bytes_body(Bytes::from_static(
-            b"<h1>503 Service Unavailable</h1>",
-        )))
+        .body(bytes_body(Bytes::from(body)))
         .expect("known-valid status and headers")
 }
 
@@ -288,6 +298,21 @@ mod tests {
     #[test]
     fn response_502_status() {
         assert_eq!(response_502().status(), 502);
+    }
+
+    #[tokio::test]
+    async fn response_retry_carries_status_and_retry_after() {
+        use http_body_util::BodyExt;
+        let resp = response_retry(StatusCode::TOO_MANY_REQUESTS, 7);
+        assert_eq!(resp.status(), 429);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "7");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"<h1>429 Too Many Requests</h1>");
+        // The pre-existing 503 helper keeps its exact output.
+        let resp = response_503_retry(2);
+        assert_eq!(resp.status(), 503);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"<h1>503 Service Unavailable</h1>");
     }
 
     #[test]

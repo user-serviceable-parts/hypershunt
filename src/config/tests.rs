@@ -2881,6 +2881,8 @@ mod auth;
 
 mod policy;
 
+mod concurrency;
+
 // -- variable definitions -------------------------------------------
 
 // Minimal listener + vhost so validate() passes; the server body is
